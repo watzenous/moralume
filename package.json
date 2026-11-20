@@ -1,0 +1,20 @@
+{
+  "name": "moralume",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Moralume — token launchpad on GIWA Sepolia built with the Ammora SDK",
+  "scripts": {
+    "build": "node build.mjs",
+    "preview": "npx --yes serve dist"
+  },
+  "dependencies": {
+    "@ammora-protocol/sdk": "0.3.9",
+    "viem": "2.33.0"
+  },
+  "devDependencies": {
+    "@fontsource/jetbrains-mono": "^5.0.0",
+    "@fontsource/plus-jakarta-sans": "^5.0.0",
+    "esbuild": "^0.25.0"
+  }
+}
