@@ -49,9 +49,12 @@ npm run build
 This produces:
 
 ```
-dist/index.html   the whole site (upload this)
-dist/_headers     extra security headers (Netlify / Cloudflare Pages use it automatically)
+dist/index.html   page shell (4 KB)
+dist/assets/      app code, on-demand swap module, CSS and fonts (content-hashed file names)
+dist/_headers     security + cache headers (Netlify / Cloudflare Pages use it automatically)
 dist/.nojekyll    for GitHub Pages
+
+Upload the whole dist/ folder.
 ```
 
 To preview the site with a working wallet, run `npm run preview` and open the URL it prints.
@@ -81,8 +84,13 @@ Transactions are signed in the visitor's own wallet extension.
 
 ## Security notes
 
-- **CSP:** Only the exact bundled script can run; it is allowed by its sha256 hash, recomputed on every build.
-  If you edit `dist/index.html` by hand, the page stops working. Always edit `src/` and rebuild.
+- **CSP:** Scripts, styles and fonts may only come from the site itself (`'self'`); the page may only
+  contact the GIWA RPC and explorer. The main script and CSS also carry SRI hashes, so a modified file
+  is refused by the browser. Always edit `src/` and rebuild instead of editing `dist/` by hand.
+- **Speed:** The first visit loads ~170 KB of gzipped JavaScript. The Ammora swap router
+  (`AmmoraSwapClient`, most of the SDK's size) is only needed for graduated tokens, so it is a
+  separate file that is fetched in the background after the page is shown. Files in `dist/assets/`
+  have hashed names and are cached for a year; `index.html` is always revalidated.
 - **Headers:** If you host on your own server, add the headers from `dist/_headers` to your server config.
   Example for nginx:
 
@@ -105,6 +113,9 @@ Transactions are signed in the visitor's own wallet extension.
 ```
 src/app.js         application (imports the SDK and viem from node_modules)
 src/config.js      your settings
-src/template.html  layout and styles
-build.mjs          bundles everything into dist/index.html and writes the CSP
+src/swap-client.js on-demand module for post-graduation swaps (AmmoraSwapClient)
+src/theme-init.js  sets day/night mode before the first paint
+src/template.html  page layout
+src/style.css      styles
+build.mjs          bundles into dist/ (hashed assets, CSP, SRI, cache headers)
 ```
