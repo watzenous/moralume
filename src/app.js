@@ -48,6 +48,13 @@ const siteConfigId = () => BigInt(SITE.launchConfigId);
 // Moderation: tokens listed in SITE.hiddenTokens (token or curve address) are not shown anywhere on this site.
 const HIDDEN = new Set((SITE.hiddenTokens || []).map((a) => String(a).toLowerCase()));
 const isHidden = (...addrs) => addrs.some((a) => a && HIDDEN.has(String(a).toLowerCase()));
+// "Official" tokens: launched on-chain by the launchpad's own wallet (or listed explicitly).
+const OFFICIAL_CREATORS = new Set((SITE.officialCreators || []).map((a) => String(a).toLowerCase()));
+const OFFICIAL_TOKENS = new Set((SITE.officialTokens || []).map((a) => String(a).toLowerCase()));
+const isOfficial = (x) => !!x && (OFFICIAL_TOKENS.size
+  ? [x.token, x.curve].some((a) => a && OFFICIAL_TOKENS.has(String(a).toLowerCase()))
+  : !!x.creator && OFFICIAL_CREATORS.has(String(x.creator).toLowerCase()));
+const officialBadge = (x) => (isOfficial(x) ? `<span class="badge b-official" title="Launched by the ${esc(SITE.name)} team">✓ Official</span>` : "");
 
 /* ───────────────────────────── small helpers ───────────────────────────── */
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -213,6 +220,8 @@ if (eth()) {
 }
 
 function renderHeader() {
+  const f = $("#faucet");
+  if (f) { const u = safeUrl(SITE.faucetUrl || ""); if (u) f.href = u; else f.remove(); }
   $("#brand").textContent = SITE.name;
   document.title = `${SITE.name} — Token launchpad on GIWA, powered by Ammora`;
   const btn = $("#connect");
@@ -233,6 +242,7 @@ function openWalletMenu() {
   m.id = "wmenu";
   m.className = "wmenu";
   m.innerHTML = `<div class="wmenu-addr mono">${esc(W.address)}</div>
+    <button data-a="earnings">My earnings</button>
     <button data-a="copy">Copy address</button>
     <button data-a="explorer">View on explorer ↗</button>
     <button data-a="switch">Switch wallet</button>
@@ -243,6 +253,7 @@ function openWalletMenu() {
   m.style.right = `${Math.max(12, window.innerWidth - r.right)}px`;
   m.querySelectorAll("button").forEach((b) => (b.onclick = async () => {
     const act = b.dataset.a;
+    if (act === "earnings") { closeWalletMenu(); location.hash = "#/earnings"; }
     if (act === "copy") { try { await navigator.clipboard.writeText(W.address); toast("Address copied."); } catch { toast("Could not copy.", "err"); } closeWalletMenu(); }
     if (act === "explorer") { window.open(addrUrl(W.address), "_blank", "noopener,noreferrer"); closeWalletMenu(); }
     if (act === "switch") { closeWalletMenu(); try { await connect(true); await ensureChain(); render(); } catch (e) { if (e.message !== "No wallet") toast(esc(errText(e)), "err"); } }
@@ -474,7 +485,7 @@ async function viewExplore(id) {
     <span class="chip">🌙 Built with the Ammora SDK on GIWA</span>
     <h1>Launch gently. Grow on a bonding curve. Graduate into real liquidity.</h1>
     <p>${esc(SITE.tagline)} Every token gets an Ammora ALC bonding curve; when the curve fills, it migrates into a permanent ARL liquidity pool.</p>
-    <div style="display:flex;gap:10px;flex-wrap:wrap"><a class="btn grad" href="#/create">Launch a token</a><a class="btn ghost" href="#/wallet">Get WETH</a></div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap"><a class="btn grad" href="#/create">Launch a token</a><a class="btn ghost" href="#/swap">Swap tokens</a></div>
     <div class="stats" id="stats">${[1, 2, 3, 4].map(() => `<div class="stat"><div class="k skel" style="height:12px;width:60%"></div><div class="v skel" style="height:24px;margin-top:8px"></div></div>`).join("")}</div>
   </section>
   <div class="toolbar">
@@ -504,10 +515,11 @@ async function viewExplore(id) {
       g.innerHTML = `<div class="empty">${ui.tab === "site" ? `No tokens on this launchpad's Config #${cfg} yet. <a href="#/create">Launch the first one →</a>` : ui.tab === "mine" && !W.address ? "Connect your wallet to see your launches." : "Nothing here yet."}</div>`;
       return;
     }
+    rows = [...rows.filter(isOfficial), ...rows.filter((x) => !isOfficial(x))];
     g.innerHTML = rows.slice(0, 120).map((x) => `
       <a class="card lcard" href="#/token/${x.curve}">
         <div class="lhead">${avatar(x)}
-          <div style="min-width:0;flex:1"><div class="lname">${esc(x.name || x.meta?.name || "Unnamed")}</div><div class="lsym">$${esc(x.symbol || x.meta?.symbol || "")}</div></div>
+          <div style="min-width:0;flex:1"><div class="lname">${esc(x.name || x.meta?.name || "Unnamed")}</div><div class="lsym">$${esc(x.symbol || x.meta?.symbol || "")} ${officialBadge(x)}</div></div>
           <div style="display:grid;gap:4px;justify-items:end">${statusBadge(x.status)}${x.configId === cfg ? `<span class="badge b-site">${esc(SITE.name)}</span>` : ""}</div>
         </div>
         <div class="ldesc">${esc(x.meta?.description || `Created by ${short(x.creator)} · Config #${x.configId}`)}</div>
@@ -613,7 +625,7 @@ async function viewToken(id, curveParam) {
     <div>
       <div class="card panel">
         <div class="thead">${avatar(x, "lg")}
-          <div style="flex:1;min-width:0"><h2>${esc(tok.name)} <span class="muted" style="font-size:18px">$${esc(tok.symbol)}</span></h2>
+          <div style="flex:1;min-width:0"><h2>${esc(tok.name)} <span class="muted" style="font-size:18px">$${esc(tok.symbol)}</span> ${officialBadge({ token: st.baseToken, curve, creator: info?.creator || st.creator })}</h2>
           <div style="display:flex;gap:6px;align-items:center;margin-top:4px;flex-wrap:wrap">${statusBadge(st.status)}${st.configId === siteConfigId() ? `<span class="badge b-site">${esc(SITE.name)}</span>` : ""}<span class="muted" style="font-size:13px">Config #${st.configId} · fee ${(st.currentFeeBps / 100).toFixed(2)}%</span></div></div>
         </div>
         ${meta.description ? `<p class="ink2" style="margin:14px 0 0;white-space:pre-wrap">${esc(meta.description)}</p>` : ""}
@@ -779,10 +791,14 @@ function tradeBox(ctx, { title, quoteFn, execFn, note }) {
   draw();
 }
 
-// Pre-graduation: trade on the Ammora ALC bonding curve.
-function tradeCurve(ctx) {
+// ── Trade engines ───────────────────────────────────────────────────────────
+// An engine quotes and builds the transaction steps for one token against WETH:
+// "buy" = WETH → token, "sell" = token → WETH. The token page and the Swap page share them.
+
+// Pre-graduation: the Ammora ALC bonding curve.
+function curveEngine(ctx) {
   const { cc } = ctx;
-  const quoteFn = async (side, amt, slip) => {
+  const quote = async (side, amt, slip) => {
     const baseForQuote = side === "sell";
     const bn = await pc.getBlockNumber();
     const q = await cc.quoteExactInputAtBlock(amt, baseForQuote, bn);
@@ -792,7 +808,7 @@ function tradeCurve(ctx) {
     else if (fill.kind !== "full") throw new Error(baseForQuote ? "This sell cannot be filled in full on the curve. Try a smaller amount." : "This order cannot be filled. Try a smaller amount.");
     return { amountOut: q.amountOut, minOut: q.amountOut * BigInt(10_000 - slip) / 10_000n, fee: q.fee, feeIsQuote: true, note, fill };
   };
-  const execFn = async (side, amt, slip) => {
+  const buildSteps = async (side, amt, slip) => {
     const baseForQuote = side === "sell";
     const bn = await pc.getBlockNumber();
     const q = await cc.quoteExactInputAtBlock(amt, baseForQuote, bn);
@@ -809,10 +825,52 @@ function tradeCurve(ctx) {
       const fresh = await cc.planSwapExactInput({ includedAmountIn: amt, baseForQuote, allowPartialFill: fill.allowPartialFill, slippageBps: slip, recipient: W.address, deadline: nowSec() + 1200n });
       return sendTx(fresh.transaction, baseForQuote ? "Sell" : "Buy");
     } });
-    await stepModal(baseForQuote ? "Selling" : "Buying", steps).run();
+    return steps;
   };
+  return { route: "bonding curve", quote, buildSteps };
+}
+
+// Post-graduation: the canonical Ammora ARL pool through AmmoraSwapClient.
+function poolEngine(ctx) {
+  const model = ctx.cfgEntry?.config?.migrationMode === 1 ? "compounding" : "concentrated";
+  const pool = ctx.st.canonicalPool;
+  const prepare = async (side, amt, slip) => {
+    const sw = await swapClient();
+    return sw.prepareExactIn({
+      model, pool, tokenIn: side === "buy" ? WETH : ctx.st.baseToken, inputAsset: "erc20", amountIn: amt,
+      payer: W.address || ctx.st.creator, recipient: W.address || ctx.st.creator, slippageBps: slip, executionMode: "direct-wallet",
+    });
+  };
+  const quote = async (side, amt, slip) => {
+    const p = await prepare(side, amt, slip);
+    const q = p.quote;
+    const impact = q.priceImpactBps != null ? Number(q.priceImpactBps) / 100 : null;
+    return {
+      amountOut: q.expectedAmountOut, minOut: q.minimumAmountOut, fee: q.feeAmount ?? 0n,
+      feeIsQuote: !q.feeToken || q.feeToken.toLowerCase() === WETH.toLowerCase(),
+      note: impact != null && impact > 5 ? `<div class="alert warn">High price impact: ${impact.toFixed(2)}%</div>` : "",
+    };
+  };
+  const buildSteps = async (side, amt, slip) => {
+    const p = await prepare(side, amt, slip);
+    if (p.quote.remainderAmountIn && p.quote.remainderAmountIn > 0n) throw new Error("The pool cannot fill this amount. Try a smaller trade.");
+    const steps = await prepSteps({ approvals: p.approvalRequirements, wethNeeded: side === "buy" ? amt : 0n });
+    steps.push({ label: side === "buy" ? `Buy ${ctx.tok.symbol} in ARL pool` : `Sell ${ctx.tok.symbol} in ARL pool`, run: async () => {
+      const fresh = await prepare(side, amt, slip);
+      return sendTx({ to: fresh.transaction.to, data: fresh.transaction.data, value: fresh.transaction.value ?? 0n }, "Swap");
+    } });
+    return steps;
+  };
+  return { route: `${model} ARL pool`, model, pool, quote, buildSteps };
+}
+
+const engineFor = (ctx) => (ctx.st.status === 1 ? curveEngine(ctx) : ctx.st.status === 3 ? poolEngine(ctx) : null);
+
+function tradeCurve(ctx) {
+  const e = curveEngine(ctx);
   tradeBox(ctx, {
-    title: "Trade on the bonding curve", quoteFn, execFn,
+    title: "Trade on the bonding curve", quoteFn: e.quote,
+    execFn: async (side, amt, slip) => stepModal(side === "sell" ? "Selling" : "Buying", await e.buildSteps(side, amt, slip)).run(),
     note: "Buys are paid in WETH; any missing WETH is wrapped from your ETH automatically. Approvals are for the exact amount only.",
   });
 }
@@ -837,41 +895,370 @@ function tradeMigrate(ctx) {
   };
 }
 
-// Post-graduation: swap on the canonical ARL pool through AmmoraSwapClient.
 function tradePool(ctx) {
-  const model = ctx.cfgEntry?.config?.migrationMode === 1 ? "compounding" : "concentrated";
-  const pool = ctx.st.canonicalPool;
-  const prepare = async (side, amt, slip) => {
-    const sw = await swapClient();
-    return sw.prepareExactIn({
-      model, pool, tokenIn: side === "buy" ? WETH : ctx.st.baseToken, inputAsset: "erc20", amountIn: amt,
-      payer: W.address || ctx.st.creator, recipient: W.address || ctx.st.creator, slippageBps: slip, executionMode: "direct-wallet",
-    });
+  const e = poolEngine(ctx);
+  tradeBox(ctx, {
+    title: `Trade in the graduated ${e.model} ARL pool`, quoteFn: e.quote,
+    execFn: async (side, amt, slip) => stepModal("Swapping", await e.buildSteps(side, amt, slip)).run(),
+    note: `This token graduated. Trades route through the canonical Ammora ARL pool <a class="mono" href="${addrUrl(e.pool)}" target="_blank" rel="noopener">${short(e.pool)}</a>.`,
+  });
+}
+
+/* ───────────────────────────── views: swap (exchange) ───────────────────────────── */
+// Swap ETH/WETH ⇄ any Ammora launch token, or token ⇄ token routed through WETH.
+// Each leg uses the token's live venue: the bonding curve before graduation, its ARL pool after.
+const ETH_ASSET = { kind: "eth", symbol: "ETH", name: "Ether (auto-wrapped to WETH)", decimals: 18 };
+const swapState = { from: ETH_ASSET, to: null, slip: SITE.defaultSlippageBps };
+const tradeCtxCache = new Map();
+
+async function loadTradeCtx(curve) {
+  if (tradeCtxCache.has(curve) && Date.now() - tradeCtxCache.get(curve).at < 15_000) return tradeCtxCache.get(curve);
+  const cc = new A.AmmoraV4LaunchCurveClient(pc, curve, CORE);
+  const bn = await pc.getBlockNumber();
+  const st = await cc.getStateAtBlock(bn);
+  const factoryToken = await pc.readContract({ address: L.factory, abi: A.ammoraLaunchFactoryV4Abi, functionName: "tokenForCurve", args: [curve] });
+  if (factoryToken === zeroAddress || factoryToken.toLowerCase() !== st.baseToken.toLowerCase()) throw new Error("Not an Ammora V4 launch.");
+  const [name, symbol, decimals] = await Promise.all(["name", "symbol", "decimals"].map((functionName) => pc.readContract({ address: st.baseToken, abi: erc20Abi, functionName })));
+  let cfgEntry = null;
+  if (st.status === 3) { try { cfgEntry = await A.getAmmoraV4ConfigAtBlock(pc, L.configRegistry, st.configId, bn); } catch {} }
+  const ctx = { at: Date.now(), cc, st, curve, cfgEntry, tok: { name, symbol, decimals: Number(decimals) } };
+  tradeCtxCache.set(curve, ctx);
+  return ctx;
+}
+const assetFromLaunch = (x) => ({ kind: "token", curve: x.curve, token: x.token, creator: x.creator, symbol: x.symbol || x.meta?.symbol || "?", name: x.name || x.meta?.name || "Unnamed", decimals: x.decimals ?? 9, meta: x.meta, status: x.status });
+const assetLabel = (a) => a ? (a.kind === "eth" ? `<div class="avatar sm eth">Ξ</div><b>ETH</b>` : `${avatar(a, "sm")}<b>${esc(a.symbol)}</b>`) : `<b>Select token</b>`;
+
+async function viewSwap(id, preselect) {
+  app.innerHTML = `
+  <div class="formcard card swapcard">
+    <span class="chip">⇄ Exchange</span>
+    <h2 style="margin-top:12px">Swap</h2>
+    <div class="muted">Swap ETH and any Ammora launch on GIWA. Each trade routes through the token's bonding curve or, after graduation, its Ammora ARL pool.</div>
+    <div class="field" style="margin-top:18px"><div class="top"><span>You pay</span><span id="sbalFrom"></span></div>
+      <div class="mid"><input id="samt" inputmode="decimal" placeholder="0.0" autocomplete="off"/><button class="assetbtn" id="pickFrom"></button></div></div>
+    <div style="display:flex;justify-content:center;margin:-6px 0"><button class="flip" id="flip" title="Switch direction">⇅</button></div>
+    <div class="field"><div class="top"><span>You receive (est.)</span><span id="sbalTo"></span></div>
+      <div class="mid"><input id="sout" placeholder="0.0" readonly tabindex="-1"/><button class="assetbtn" id="pickTo"></button></div></div>
+    <div class="quote" id="squote" style="display:none"></div>
+    <div id="snote"></div>
+    <button class="btn grad block" id="sgo" style="margin-top:12px"></button>
+    <div class="row note"><span>Slippage (per leg)</span><select id="sslip" class="inp" style="padding:4px 8px;width:auto">${[50, 100, 300, 500, 1000].map((b) => `<option value="${b}" ${b === swapState.slip ? "selected" : ""}>${b / 100}%</option>`).join("")}</select></div>
+    <div class="note">ETH is wrapped to WETH automatically when needed; token → ETH swaps pay out WETH (unwrap it on the ETH ⇄ WETH page). Token → token swaps run as two trades through WETH.</div>
+  </div>`;
+
+  let list = [];
+  try { list = await loadLaunches(); } catch {}
+  if (id !== renderId) return;
+  const tradable = list.filter((x) => (x.status === 1 || x.status === 3) && !isHidden(x.token, x.curve));
+  if (preselect) {
+    const x = tradable.find((y) => y.curve.toLowerCase() === preselect.toLowerCase() || y.token.toLowerCase() === preselect.toLowerCase());
+    if (x) { swapState.to = assetFromLaunch(x); if (swapState.from.kind !== "eth" && swapState.from.curve === x.curve) swapState.from = ETH_ASSET; }
+  }
+
+  let seq = 0, timer, quoteRes = null;
+  const parseIn = () => {
+    const v = ($("#samt")?.value || "").trim();
+    if (!/^\d*\.?\d+$/.test(v)) return 0n;
+    try { return parseUnits(v, swapState.from.decimals); } catch { return 0n; }
   };
-  const quoteFn = async (side, amt, slip) => {
-    const p = await prepare(side, amt, slip);
-    const q = p.quote;
-    const impact = q.priceImpactBps != null ? Number(q.priceImpactBps) / 100 : null;
+  const showBalances = async () => {
+    if (!W.address) { $("#sbalFrom").textContent = ""; $("#sbalTo").textContent = ""; return; }
+    const bal = async (a) => {
+      if (!a) return "";
+      if (a.kind === "eth") {
+        const [e, w] = await Promise.all([pc.getBalance({ address: W.address }), balanceOf(WETH, W.address)]);
+        return `${Number(formatUnits(e, 18)).toFixed(5)} ETH · ${Number(formatUnits(w, 18)).toFixed(5)} WETH`;
+      }
+      return `Balance: ${fmtUnits(await balanceOf(a.token, W.address), a.decimals)}`;
+    };
+    try { $("#sbalFrom").innerHTML = await bal(swapState.from); $("#sbalTo").innerHTML = await bal(swapState.to); } catch {}
+  };
+  const draw = () => {
+    $("#pickFrom").innerHTML = assetLabel(swapState.from) + " ▾";
+    $("#pickTo").innerHTML = assetLabel(swapState.to) + " ▾";
+    const g = $("#sgo");
+    g.textContent = !W.address ? "Connect wallet" : !swapState.to ? "Select a token" : "Swap";
+    showBalances();
+    requote();
+  };
+
+  // Quote: one leg (ETH ⇄ token) or two legs (token → WETH → token).
+  const quote = async (amt) => {
+    const { from, to, slip } = swapState;
+    if (from.kind === "eth") {
+      const ctx = await loadTradeCtx(to.curve), e = engineFor(ctx);
+      if (!e) throw new Error(`${to.symbol} is not tradable right now (waiting for migration).`);
+      const q = await e.quote("buy", amt, slip);
+      return { amountOut: q.amountOut, minOut: q.minOut, outDec: ctx.tok.decimals, route: `ETH → ${ctx.tok.symbol} via ${e.route}`, note: q.note, legs: [{ ctx, e, side: "buy" }] };
+    }
+    if (to.kind === "eth") {
+      const ctx = await loadTradeCtx(from.curve), e = engineFor(ctx);
+      if (!e) throw new Error(`${from.symbol} is not tradable right now (waiting for migration).`);
+      const q = await e.quote("sell", amt, slip);
+      return { amountOut: q.amountOut, minOut: q.minOut, outDec: 18, outSym: "WETH", route: `${ctx.tok.symbol} → WETH via ${e.route}`, note: q.note, legs: [{ ctx, e, side: "sell" }] };
+    }
+    const [ca, cb] = await Promise.all([loadTradeCtx(from.curve), loadTradeCtx(to.curve)]);
+    const ea = engineFor(ca), eb = engineFor(cb);
+    if (!ea || !eb) throw new Error("One of these tokens is not tradable right now (waiting for migration).");
+    const q1 = await ea.quote("sell", amt, slip);
+    const q2 = await eb.quote("buy", q1.minOut, slip);         // conservative: second leg priced from leg-1 minimum
+    const q2exp = await eb.quote("buy", q1.amountOut, slip).catch(() => q2);
     return {
-      amountOut: q.expectedAmountOut, minOut: q.minimumAmountOut, fee: q.feeAmount ?? 0n,
-      feeIsQuote: !q.feeToken || q.feeToken.toLowerCase() === WETH.toLowerCase(),
-      note: impact != null && impact > 5 ? `<div class="alert warn">High price impact: ${impact.toFixed(2)}%</div>` : "",
+      amountOut: q2exp.amountOut, minOut: q2.minOut, outDec: cb.tok.decimals,
+      route: `${ca.tok.symbol} → WETH (${ea.route}) → ${cb.tok.symbol} (${eb.route})`,
+      note: [q1.note, q2.note].filter(Boolean).join(""), legs: [{ ctx: ca, e: ea, side: "sell" }, { ctx: cb, e: eb, side: "buy" }],
     };
   };
-  const execFn = async (side, amt, slip) => {
-    const p = await prepare(side, amt, slip);
-    if (p.quote.remainderAmountIn && p.quote.remainderAmountIn > 0n) throw new Error("The pool cannot fill this amount. Try a smaller trade.");
-    const steps = await prepSteps({ approvals: p.approvalRequirements, wethNeeded: side === "buy" ? amt : 0n });
-    steps.push({ label: side === "buy" ? `Buy ${ctx.tok.symbol} in ARL pool` : `Sell ${ctx.tok.symbol} in ARL pool`, run: async () => {
-      const fresh = await prepare(side, amt, slip);
-      return sendTx({ to: fresh.transaction.to, data: fresh.transaction.data, value: fresh.transaction.value ?? 0n }, "Swap");
-    } });
-    await stepModal("Swapping", steps).run();
+  function requote() {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const amt = parseIn(), my = ++seq;
+      quoteRes = null;
+      $("#snote").innerHTML = "";
+      if (!amt || !swapState.to) { $("#sout").value = ""; $("#squote").style.display = "none"; return; }
+      $("#sout").value = "Quoting…";
+      try {
+        const q = await quote(amt);
+        if (my !== seq) return;
+        quoteRes = q;
+        $("#sout").value = formatUnits(q.amountOut, q.outDec);
+        const outSym = q.outSym || (swapState.to.kind === "eth" ? "WETH" : swapState.to.symbol);
+        $("#squote").style.display = "grid";
+        $("#squote").innerHTML = `<div class="row"><span class="muted">Minimum received</span><b>${fmtUnits(q.minOut, q.outDec)} ${esc(outSym)}</b></div>
+          <div class="row"><span class="muted">Route</span><span style="text-align:right">${esc(q.route)}</span></div>`;
+        $("#snote").innerHTML = q.note || "";
+      } catch (e) {
+        if (my !== seq) return;
+        $("#sout").value = "";
+        $("#squote").style.display = "none";
+        $("#snote").innerHTML = `<div class="alert err">${esc(errText(e))}</div>`;
+      }
+    }, 350);
+  }
+
+  // Token picker
+  const pick = (which) => {
+    const bg = document.createElement("div");
+    bg.className = "modal-bg";
+    bg.innerHTML = `<div class="modal picker"><h3>Select a token</h3>
+      <input class="inp" id="pq" placeholder="Search name, symbol or paste address" autocomplete="off"/>
+      <div class="plist" id="plist"></div><button class="btn ghost block" id="pclose" style="margin-top:10px">Close</button></div>`;
+    document.body.appendChild(bg);
+    const close = () => bg.remove();
+    bg.onclick = (e) => { if (e.target === bg) close(); };
+    $("#pclose", bg).onclick = close;
+    const other = which === "from" ? swapState.to : swapState.from;
+    const cfg = siteConfigId();
+    const sorted = [...tradable].sort((a, b) => isOfficial(b) - isOfficial(a) || (b.configId === cfg) - (a.configId === cfg) || (b.mcap || 0) - (a.mcap || 0));
+    const render_ = () => {
+      const q = $("#pq", bg).value.trim().toLowerCase();
+      const rows = [ETH_ASSET, ...sorted.map(assetFromLaunch)]
+        .filter((a) => !(other && other.kind === a.kind && (a.kind === "eth" || a.curve === other.curve)))
+        .filter((a) => !q || [a.symbol, a.name, a.token, a.curve].some((v) => String(v || "").toLowerCase().includes(q)))
+        .slice(0, 80);
+      $("#plist", bg).innerHTML = rows.length ? rows.map((a, i) => `<button class="prow" data-i="${i}">${a.kind === "eth" ? `<div class="avatar sm eth">Ξ</div>` : avatar(a, "sm")}
+          <span style="flex:1;min-width:0;text-align:left"><b>${esc(a.symbol)}</b> ${a.kind === "token" ? officialBadge(a) : ""}<br><span class="muted" style="font-size:12px">${esc(a.name)}</span></span>
+          ${a.kind === "token" ? statusBadge(a.status) : ""}</button>`).join("") : `<div class="muted" style="padding:14px">No tradable token found.</div>`;
+      $("#plist", bg).querySelectorAll(".prow").forEach((b) => (b.onclick = () => {
+        const a = rows[Number(b.dataset.i)];
+        swapState[which] = a;
+        close(); draw();
+      }));
+    };
+    $("#pq", bg).oninput = render_;
+    render_();
+    $("#pq", bg).focus();
   };
-  tradeBox(ctx, {
-    title: `Trade in the graduated ${model} ARL pool`, quoteFn, execFn,
-    note: `This token graduated. Trades route through the canonical Ammora ARL pool <a class="mono" href="${addrUrl(pool)}" target="_blank" rel="noopener">${short(pool)}</a>.`,
-  });
+
+  $("#pickFrom").onclick = () => pick("from");
+  $("#pickTo").onclick = () => pick("to");
+  $("#flip").onclick = () => {
+    if (!swapState.to) return;
+    [swapState.from, swapState.to] = [swapState.to, swapState.from];
+    $("#samt").value = "";
+    draw();
+  };
+  $("#samt").oninput = requote;
+  $("#sslip").onchange = (e) => { swapState.slip = Number(e.target.value); requote(); };
+  $("#sgo").onclick = async () => {
+    try {
+      await ensureWallet();
+      if (!swapState.to) return pick("to");
+      const amt = parseIn();
+      if (!amt) throw new Error("Enter an amount.");
+      if (swapState.from.kind === "token") {
+        const bal = await balanceOf(swapState.from.token, W.address);
+        if (bal < amt) throw new Error(`Insufficient ${swapState.from.symbol} balance.`);
+      }
+      $("#sgo").disabled = true;
+      const q = await quote(amt);
+      let steps;
+      if (q.legs.length === 1) {
+        const { e, side } = q.legs[0];
+        steps = await e.buildSteps(side, amt, swapState.slip);
+      } else {
+        // Leg 1: token A → WETH. Leg 2 spends exactly the WETH that leg 1 delivered.
+        const [l1, l2] = q.legs;
+        const wBefore = await balanceOf(WETH, W.address);
+        steps = await l1.e.buildSteps("sell", amt, swapState.slip);
+        steps.push({ label: `Buy ${l2.ctx.tok.symbol} with the WETH received`, run: async () => {
+          let got = 0n;
+          for (let i = 0; i < 5 && got <= 0n; i++) { got = (await balanceOf(WETH, W.address)) - wBefore; if (got <= 0n) await sleep(2000); }
+          if (got <= 0n) throw new Error("Could not confirm the WETH from the first trade. Your WETH is safe in your wallet; buy the second token from its page.");
+          for (const st of await l2.e.buildSteps("buy", got, swapState.slip)) await st.run();
+        } });
+      }
+      await stepModal("Swapping", steps).run();
+      tradeCtxCache.clear();
+      launchCache.at = 0;
+      $("#samt").value = "";
+      draw();
+    } catch (e) {
+      if (e.message !== "No wallet") toast(esc(errText(e)), "err", 9000);
+    } finally { const g = $("#sgo"); if (g) g.disabled = false; }
+  };
+  draw();
+}
+
+
+// ── Atomic first buy helpers ──────────────────────────────────────────────────
+// A fresh curve's first buy is fully determined by its Config, so the expected output can be
+// computed exactly (checked against live fresh curves to the wei) for plain-fee Configs.
+function atomicFirstBuyEligible(c) {
+  return !!c && !c.dynamicFeeEnabled && !c.rateLimiterEnabled && !c.enableFirstSwapWithMinFee
+    && Number(c.feeSchedulerMode) === 0 && Number(c.feeNumberOfPeriods) === 0 && Number(c.collectFeeMode) === 0
+    && Number(c.activationDelay) === 0;
+}
+function freshCurveBuyQuote(config, segments, amountIn) {
+  const Q2 = 1n << 128n;
+  const fee = amountIn * BigInt(config.cliffFeeBps) / 10_000n;
+  let rem = amountIn - fee, out = 0n, s = config.startSqrtPrice;
+  for (const seg of segments) {
+    if (rem <= 0n) break;
+    if (s >= seg.upperSqrtPrice) continue;
+    if (s < seg.lowerSqrtPrice) s = seg.lowerSqrtPrice;
+    const Lq = seg.liquidity;                                     // Q64-scaled liquidity
+    const maxIn = Lq * (seg.upperSqrtPrice - s) / Q2;             // quote needed to reach the segment top
+    let s1;
+    if (rem >= maxIn) { s1 = seg.upperSqrtPrice; rem -= maxIn; }
+    else { s1 = s + rem * Q2 / Lq; rem = 0n; }
+    out += Lq * (s1 - s) / (s * s1);                              // base released between s and s1
+    s = s1;
+  }
+  return { amountOut: out, fee, unfilled: rem };
+}
+
+/* ───────────────────────────── views: earnings ───────────────────────────── */
+// Creator / partner launch fees (Ammora FeeVault) and graduated LP-position fees (ARL position NFTs).
+const TRANSFER_TOPIC = toEventSelector("Transfer(address,address,uint256)");
+let arlOptions = null;
+const dammOptions = () => (arlOptions ??= { deploymentSource: A.createAmmoraDeploymentSource([D]), factoryProfiles: A.giwaSepoliaAutoRoutePoolProfiles });
+
+async function viewEarnings(id) {
+  if (!W.address) {
+    app.innerHTML = `<div class="formcard card" style="max-width:560px"><span class="chip">💰 Earnings</span><h2 style="margin-top:12px">Your earnings</h2>
+      <div class="muted">Connect your wallet to see and claim the fees you earned as a token creator, as a launchpad partner, or from graduated liquidity positions.</div>
+      <button class="btn grad block" id="econnect" style="margin-top:16px">Connect wallet</button></div>`;
+    $("#econnect").onclick = async () => { try { await connect(); await ensureChain(); render(); } catch (e) { if (e.message !== "No wallet") toast(esc(errText(e)), "err"); } };
+    return;
+  }
+  const me = W.address;
+  app.innerHTML = `
+  <div class="formcard card" style="max-width:820px">
+    <span class="chip">💰 Earnings</span>
+    <h2 style="margin-top:12px">Your earnings</h2>
+    <div class="muted">Fees earned by <span class="mono">${short(me)}</span> across every Ammora launch on GIWA: as a token creator, as a launchpad partner, and from liquidity positions created at graduation.</div>
+    <div class="sect">Launch trading fees</div>
+    <div id="evault"><div class="skel" style="height:60px"></div></div>
+    <div class="sect">Graduated liquidity positions</div>
+    <div id="elp"><div class="skel" style="height:60px"></div></div>
+    <div class="sect">Your launches</div>
+    <div id="emine"><div class="skel" style="height:40px"></div></div>
+  </div>`;
+
+  // 1) FeeVault: creator + partner shares of bonding-curve trading fees, paid in WETH.
+  const loadVault = async () => {
+    try {
+      const vault = await pc.readContract({ address: L.factory, abi: A.ammoraLaunchFactoryV4Abi, functionName: "feeVault" });
+      const owed = await pc.readContract({ address: vault, abi: A.feeVaultAbi, functionName: "claimable", args: [WETH, me] });
+      if (id !== renderId) return;
+      $("#evault").innerHTML = `<div class="earnrow"><div><div class="muted" style="font-size:12px">Claimable in the Ammora fee vault</div>
+        <div style="font-size:24px;font-weight:800">${fmtUnits(owed, 18, 6)} WETH</div>
+        <div class="muted" style="font-size:12px">Creator and partner shares from bonding-curve trades. The vault adds up all your launches.</div></div>
+        <button class="btn grad" id="eclaimv" ${owed > 0n ? "" : "disabled"}>${owed > 0n ? "Claim" : "Nothing to claim"}</button></div>`;
+      $("#eclaimv").onclick = async () => {
+        try {
+          await ensureWallet();
+          $("#eclaimv").disabled = true;
+          const tx = A.buildClaimFeeVaultFor(WETH, me, me);
+          await stepModal("Claiming fees", [{ label: `Claim ${fmtUnits(owed, 18, 6).replace(/<[^>]+>/g, "")} WETH`, run: () => sendTx({ to: vault, data: tx.data }, "Fee claim") }]).run();
+          setTimeout(loadVault, 2500);
+        } catch (e) { toast(esc(errText(e)), "err", 9000); const b = $("#eclaimv"); if (b) b.disabled = false; }
+      };
+    } catch (e) { if (id === renderId) $("#evault").innerHTML = `<div class="alert err">Could not read the fee vault: ${esc(errText(e))}</div>`; }
+  };
+
+  // 2) LP NFTs received at graduation (or later), found through ERC-721 Transfer logs to this wallet.
+  const loadLp = async () => {
+    try {
+      const PM = L.concentratedPositionManager;
+      const logs = await explorerLogs({ address: PM, topic0: TRANSFER_TOPIC, topic2: "0x" + me.slice(2).toLowerCase().padStart(64, "0") });
+      const ids = [...new Set(logs.map((l) => BigInt(l.topics[3])))].slice(-60);
+      const launches = await loadLaunches().catch(() => []);
+      const rows = [];
+      for (const tokenId of ids) {
+        const owner = await pc.readContract({ address: PM, abi: A.ammConcentratedPositionManagerV3Abi, functionName: "ownerOf", args: [tokenId] }).catch(() => null);
+        if (!owner || owner.toLowerCase() !== me.toLowerCase()) continue;
+        const pos = await pc.readContract({ address: PM, abi: A.ammConcentratedPositionManagerV3Abi, functionName: "getPosition", args: [tokenId] });
+        let base = 0n, quote = 0n;
+        try {
+          const { result } = await pc.simulateContract({ address: PM, abi: A.ammConcentratedPositionManagerV3Abi, functionName: "claimPositionFees", args: [tokenId, me], account: me });
+          [base, quote] = result;
+        } catch {}
+        const launch = launches.find((x) => x.pool && x.pool.toLowerCase() === pos.pool.toLowerCase());
+        rows.push({ tokenId, pool: pos.pool, base, quote, launch, locked: pos.permanentLockedLiquidity > 0n });
+      }
+      if (id !== renderId) return;
+      if (!rows.length) { $("#elp").innerHTML = `<div class="muted">No liquidity positions yet. When a token you created (or partnered) graduates, its LP position appears here and keeps earning pool fees.</div>`; return; }
+      $("#elp").innerHTML = `<div style="overflow:auto"><table><thead><tr><th>Position</th><th>Token</th><th>Claimable</th><th></th></tr></thead><tbody>
+        ${rows.map((r, i) => {
+          const dec = r.launch?.decimals ?? 9, sym = r.launch?.symbol || "token";
+          const has = r.base > 0n || r.quote > 0n;
+          return `<tr><td>#${r.tokenId}${r.locked ? ` <span class="badge b-grad">locked</span>` : ""}</td>
+            <td>${r.launch ? `<a href="#/token/${r.launch.curve}">$${esc(sym)}</a>` : `<a class="mono" href="${addrUrl(r.pool)}" target="_blank" rel="noopener">${short(r.pool)}</a>`}</td>
+            <td>${fmtUnits(r.quote, 18, 6)} WETH<br><span class="muted">${fmtUnits(r.base, dec)} ${esc(sym)}</span></td>
+            <td style="text-align:right"><button class="btn small ${has ? "grad" : "ghost"}" data-i="${i}" ${has ? "" : "disabled"}>${has ? "Claim" : "—"}</button></td></tr>`;
+        }).join("")}</tbody></table></div>
+        <div class="note">Locked positions cannot be withdrawn, but their trading fees are always claimable.</div>`;
+      $("#elp").querySelectorAll("button[data-i]").forEach((b) => (b.onclick = async () => {
+        const r = rows[Number(b.dataset.i)];
+        try {
+          await ensureWallet();
+          b.disabled = true;
+          const sdk = new A.DammV2Client(pc, r.pool, "concentrated", L.concentratedFactory, L.concentratedPositionManager, dammOptions());
+          await stepModal("Claiming LP fees", [{ label: `Claim fees of position #${r.tokenId}`, run: async () => {
+            const tx = await sdk.planClaimManagedConcentratedFees(r.tokenId, me, me);
+            return sendTx({ to: tx.to, data: tx.data }, "LP fee claim");
+          } }]).run();
+          setTimeout(loadLp, 2500);
+        } catch (e) { toast(esc(errText(e)), "err", 9000); b.disabled = false; }
+      }));
+    } catch (e) { if (id === renderId) $("#elp").innerHTML = `<div class="alert err">Could not load positions: ${esc(errText(e))}</div>`; }
+  };
+
+  // 3) Tokens this wallet created.
+  const loadMine = async () => {
+    try {
+      const list = (await loadLaunches()).filter((x) => x.creator.toLowerCase() === me.toLowerCase() && !isHidden(x.token, x.curve));
+      if (id !== renderId) return;
+      $("#emine").innerHTML = list.length ? `<div class="grid" style="margin:0">${list.slice(0, 30).map((x) => `
+        <a class="card lcard" href="#/token/${x.curve}"><div class="lhead">${avatar(x)}<div style="min-width:0;flex:1"><div class="lname">${esc(x.name || "Unnamed")}</div><div class="lsym">$${esc(x.symbol || "")}</div></div>${statusBadge(x.status)}</div>
+        <div><div class="row" style="margin-bottom:6px"><span class="muted">Bonding curve</span><b>${(x.progress * 100).toFixed(1)}%</b></div><div class="bar"><i style="width:${(x.progress * 100).toFixed(1)}%"></i></div></div></a>`).join("")}</div>`
+        : `<div class="muted">You have not launched a token yet. <a href="#/create">Launch one →</a></div>`;
+    } catch { if (id === renderId) $("#emine").innerHTML = `<div class="muted">Could not load your launches.</div>`; }
+  };
+
+  loadVault(); loadMine(); loadLp();
 }
 
 /* ───────────────────────────── views: create ───────────────────────────── */
@@ -897,7 +1284,7 @@ async function viewCreate(id) {
       <div><label class="l">Website (optional)</label><input class="inp" id="web" placeholder="https://"/></div>
       <div><label class="l">X / Twitter (optional)</label><input class="inp" id="tw" placeholder="https://x.com/…"/></div>
       <div><label class="l">Telegram (optional)</label><input class="inp" id="tg" placeholder="https://t.me/…"/></div>
-      <div><label class="l">Initial buy in ETH (optional)</label><input class="inp" id="first" inputmode="decimal" placeholder="0.001"/><div class="help">Bought right after creation (wrapped to WETH automatically).</div></div>
+      <div><label class="l">Initial buy in ETH (optional)</label><input class="inp" id="first" inputmode="decimal" placeholder="0.001"/><div class="help">Bought in the same transaction as the launch, so nobody can buy before you. ETH is wrapped to WETH automatically.</div></div>
     </div>
     <div id="cmsg"></div>
     <button class="btn grad block" id="launch" style="margin-top:16px">${W.address ? "Launch token" : "Connect wallet & launch"}</button>
@@ -971,7 +1358,15 @@ async function viewCreate(id) {
       const metadataURI = built.uri;
       const meta = built.meta;
       $("#launch").disabled = true;
-      let created;
+      let created, atomicDone = false;
+      const recordLaunch = (receipt) => {
+        created = A.parseAmmoraV4LaunchCreatedReceipt(receipt, L.factory);
+        if (created.configId !== cfgId || created.configHash !== cfg.configHash) throw new Error("Launch receipt does not match the selected Config.");
+        rememberLaunch({ token: created.token, curve: created.curve, creator: W.address, configId: cfgId, configHash: cfg.configHash, metadataURI, block: Number(receipt.blockNumber), time: Math.floor(Date.now() / 1000), tx: receipt.transactionHash });
+        metaCache.set(metadataURI, meta);
+        launchCache.at = 0;
+      };
+      const launchArgs = () => ({ name, symbol, metadataURI, creatorMetadataURI: metadataURI, tokenDecimals: cfg.config.tokenDecimals });
       const steps = [
         { label: "Verify Ammora V4 contracts & Config", run: async () => {
           const bn = await pc.getBlockNumber();
@@ -981,19 +1376,60 @@ async function viewCreate(id) {
           const ethBal = await pc.getBalance({ address: W.address });
           if (ethBal < cfg.config.poolCreationFee + firstBuy) throw new Error("Not enough ETH for the creation fee and initial buy (plus gas).");
         } },
-        { label: `Create $${symbol} + bonding curve`, run: async () => {
-          const tx = A.buildCreateAmmoraV4Launch({ name, symbol, metadataURI, creatorMetadataURI: metadataURI, tokenDecimals: cfg.config.tokenDecimals }, cfgId, cfg.config.poolCreationFee);
-          const receipt = await sendTx({ to: L.factory, data: tx.data, value: tx.value ?? 0n }, "Token launch");
-          created = A.parseAmmoraV4LaunchCreatedReceipt(receipt, L.factory);
-          if (created.configId !== cfgId || created.configHash !== cfg.configHash) throw new Error("Launch receipt does not match the selected Config.");
-          rememberLaunch({ token: created.token, curve: created.curve, creator: W.address, configId: cfgId, configHash: cfg.configHash, metadataURI, block: Number(receipt.blockNumber), time: Math.floor(Date.now() / 1000), tx: receipt.transactionHash });
-          metaCache.set(metadataURI, meta);
-          launchCache.at = 0;
-        } },
       ];
+      if (firstBuy > 0n && atomicFirstBuyEligible(cfg?.config)) {
+        // Launch + first buy in ONE transaction through Ammora's FirstBuyExecutor: nobody can buy before the creator.
+        const planAtomic = async () => {
+          const bn = await pc.getBlockNumber();
+          const ctx = await A.verifyAmmoraPortableDeploymentAtBlock(pc, A.giwaSepoliaAtomicLaunchDeployment, bn);
+          const quoteOut = freshCurveBuyQuote(cfg.config, cfg.segments, firstBuy);
+          if (quoteOut.unfilled > 0n || quoteOut.amountOut <= 0n) throw new Error("The initial buy is larger than the bonding curve allows. Use a smaller amount.");
+          const fees = await pc.estimateFeesPerGas();
+          return new A.AmmoraPortableLifecyclePlanner(ctx, A.giwaSepoliaAtomicLaunchTargets).planExistingConfigAtomicFirstBuy({
+            account: W.address, configId: cfgId, expectedConfigHash: cfg.configHash, launch: launchArgs(),
+            firstBuys: [{ includedQuoteAmountRaw: firstBuy, minimumBaseAmountOutRaw: quoteOut.amountOut * 99n / 100n, allowPartialFill: false, recipient: W.address }],
+            deadline: nowSec() + 1800n, allowancePolicy: "prepare-approval",
+            gas: { maxFeePerGasNativeRaw: (fees.maxFeePerGas ?? fees.gasPrice ?? 1_000_000n) * 2n, safetyMarginBps: 2000n },
+          });
+        };
+        steps.push(
+          { label: "Prepare WETH for the first buy", run: async () => {
+            const wbal = await balanceOf(WETH, W.address);
+            if (wbal >= firstBuy) return;
+            const diff = firstBuy - wbal;
+            return sendTx({ to: WETH, data: encodeFunctionData({ abi: wethAbi, functionName: "deposit" }), value: diff }, "Wrap ETH");
+          } },
+          { label: "Approve the first buy (exact amount)", run: async () => {
+            const plan = await planAtomic();
+            if (plan.status !== "APPROVAL_REQUIRED") return;
+            const a = plan.approvalRequirements?.[0];
+            if (!a || a.token.toLowerCase() !== WETH.toLowerCase() || a.exactAmountRaw !== firstBuy) throw new Error("Unexpected approval request from the planner.");
+            return sendTx(plan.transaction, "Approval");
+          } },
+          { label: `Create $${symbol} + first buy in one transaction`, run: async () => {
+            let plan;
+            for (let i = 0; i < 4; i++) {                   // RPC replicas can lag behind the approval
+              plan = await planAtomic();
+              if (plan.status === "READY") break;
+              await sleep(2500);
+            }
+            if (plan.status !== "READY") throw new Error("The approval is not visible yet. Wait a few seconds and try again.");
+            if (plan.transaction.to.toLowerCase() !== L.factory.toLowerCase()) throw new Error("Unexpected launch target.");
+            const receipt = await sendTx({ to: plan.transaction.to, data: plan.transaction.data, value: plan.transaction.value ?? 0n }, "Launch + first buy");
+            recordLaunch(receipt);
+            atomicDone = true;
+          } },
+        );
+      } else {
+        steps.push({ label: `Create $${symbol} + bonding curve`, run: async () => {
+          const tx = A.buildCreateAmmoraV4Launch(launchArgs(), cfgId, cfg.config.poolCreationFee);
+          recordLaunch(await sendTx({ to: L.factory, data: tx.data, value: tx.value ?? 0n }, "Token launch"));
+        } });
+      }
       await stepModal(`Launching ${name}`, steps).run();
-      if (firstBuy > 0n) sessionStorage.setItem("moralume.prefillBuy", firstStr);
-      toast(`🎉 $${esc(symbol)} is live!${firstBuy > 0n ? " Confirm your initial buy on the token page." : ""}`, "ok", 9000);
+      const needsBuy = firstBuy > 0n && !atomicDone;
+      if (needsBuy) sessionStorage.setItem("moralume.prefillBuy", firstStr);
+      toast(`🎉 $${esc(symbol)} is live!${atomicDone ? " Your first buy is in." : needsBuy ? " Confirm your initial buy on the token page." : ""}`, "ok", 9000);
       await sleep(1500);
       location.hash = `#/token/${created.curve}`;
     } catch (e) {
@@ -1051,7 +1487,10 @@ async function viewWallet(id) {
       <button class="btn grad" id="wrap">Wrap ETH → WETH</button>
       <button class="btn ghost" id="unwrap">Unwrap WETH → ETH</button>
     </div>
-    <div class="note">Need testnet ETH? Get GIWA Sepolia ETH from a faucet listed in the <a href="https://docs.giwa.io" target="_blank" rel="noopener">GIWA docs</a>.</div>
+    <div class="note">Need testnet ETH? Free GIWA Sepolia ETH faucets:
+      <a href="https://faucet.giwa.io" target="_blank" rel="noopener noreferrer">GIWA Faucet</a> ·
+      <a href="https://faucet.lambda256.io/giwa-sepolia" target="_blank" rel="noopener noreferrer">Nodit</a> ·
+      <a href="https://www.alchemy.com/faucets/giwa-sepolia" target="_blank" rel="noopener noreferrer">Alchemy</a></div>
   </div>`;
   const load = async () => {
     if (!W.address || id !== renderId) return;
@@ -1084,6 +1523,8 @@ async function render() {
   if (route === "token" && arg) return viewToken(id, arg);
   if (route === "create") return viewCreate(id);
   if (route === "wallet") return viewWallet(id);
+  if (route === "swap") return viewSwap(id, arg);
+  if (route === "earnings") return viewEarnings(id);
   return viewExplore(id);
 }
 window.addEventListener("hashchange", render);

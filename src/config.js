@@ -16,11 +16,22 @@ export const SITE = {
   // Example: hiddenTokens: ["0x1234…", "0xabcd…"],
   hiddenTokens: [],
 
+  // "Official" badge. Tokens created on-chain by one of these wallets get the badge automatically
+  // and are pinned to the top of the explore list. Matching uses the on-chain creator address,
+  // so a copycat token with the same name never gets the badge.
+  officialCreators: ["0xFa256d8b6F73f719b88F8e4281d6741184F9B88C"],
+  // Optional: limit the badge to specific tokens (token or curve addresses). When this list is
+  // not empty, only these tokens are official, even if the same wallet launched others.
+  officialTokens: [],
+
   // Optional links shown in the footer.
   links: {
     x: "",        // e.g. "https://x.com/yourhandle"
     github: "",   // e.g. "https://github.com/you/moralume"
   },
+
+  // "Get test ETH" button in the header (left of the wallet button).
+  faucetUrl: "https://faucet.giwa.io",
 
   // Default slippage for trades, in basis points (100 = 1%).
   defaultSlippageBps: 100,

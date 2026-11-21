@@ -90,6 +90,8 @@ header{position:sticky;top:0;z-index:20;background:rgba(251,248,244,.86);backdro
 .badge{font-size:11px;font-weight:800;padding:3px 8px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em}
 .b-live{background:#eef5f1;color:#3f7f66} .b-ready{background:#fff6e5;color:var(--warn)} .b-grad{background:#fdeee7;color:var(--brand1)} .b-off{background:#f5efe9;color:var(--mute)}
 .b-site{background:var(--sagesoft);color:#3f7f66}
+.b-official{background:var(--ink);color:#fff;text-transform:none;letter-spacing:0;font-size:11px;vertical-align:middle;white-space:nowrap}
+.lsym .b-official{margin-left:4px}
 .empty{padding:50px 20px;text-align:center;color:var(--mute);grid-column:1/-1}
 .skel{background:linear-gradient(90deg,#f3ece5,#faf6f1,#f3ece5);background-size:200% 100%;animation:sk 1.2s infinite;border-radius:8px}
 @keyframes sk{to{background-position:-200% 0}}
@@ -159,6 +161,22 @@ textarea.inp{min-height:84px;resize:vertical}
 .txstep.fail{color:var(--bad)} .txstep.fail i{background:var(--bad);border-color:var(--bad);color:#fff}
 @keyframes spin{to{transform:rotate(360deg)}}
 
+.faucet{display:inline-flex;align-items:center;gap:2px}
+.faucet:hover{text-decoration:none;border-color:#f0b39e}
+.earnrow{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;background:#faf6f1;border:1px solid var(--line2);border-radius:14px;padding:14px 16px}
+/* swap */
+.swapcard{max-width:520px}
+.assetbtn{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);background:#faf6f1;border-radius:999px;padding:6px 12px 6px 6px;font-weight:700;white-space:nowrap;color:var(--ink)}
+.assetbtn:hover{border-color:#f0b39e}
+.avatar.sm{width:26px;height:26px;font-size:12px}
+.avatar.eth{background:var(--ink);color:#fff}
+.flip{width:38px;height:38px;border-radius:50%;border:4px solid var(--bg);background:#fff;box-shadow:var(--shadow);font-size:16px;font-weight:800;color:var(--ink);position:relative;z-index:1}
+.flip:hover{background:var(--soft)}
+#sout{color:var(--ink2)}
+.picker{max-width:420px}
+.plist{max-height:50vh;overflow:auto;margin-top:10px;display:grid;gap:2px}
+.prow{display:flex;align-items:center;gap:10px;border:0;background:transparent;padding:8px;border-radius:12px;color:var(--ink);width:100%}
+.prow:hover{background:#faf6f1}
 /* wallet menu */
 .wmenu{position:fixed;z-index:40;background:#fff;border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);padding:8px;min-width:230px;display:grid;gap:2px}
 .wmenu-addr{font-size:11px;color:var(--mute);padding:6px 10px 8px;word-break:break-all;border-bottom:1px solid var(--line2);margin-bottom:4px}
@@ -178,7 +196,8 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:10px 22px;justify-content:space-bet
   .links a{padding:6px 10px;font-size:14px}
 }
 @media (max-width:520px){
-  .netpill{display:none} .stats{grid-template-columns:1fr 1fr} .kv{grid-template-columns:1fr 1fr}
+  .nav{gap:8px} .logo{font-size:18px;gap:8px} .logo .mark{width:30px;height:30px} #connect{padding:8px 12px;font-size:14px} .faucet{padding:7px 10px}
+  .netpill{display:none} .faucet .ftext{display:none} .stats{grid-template-columns:1fr 1fr} .kv{grid-template-columns:1fr 1fr}
   .tabs{overflow-x:auto;max-width:100%} .search{max-width:none}
 }
 </style>
@@ -189,10 +208,13 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:10px 22px;justify-content:space-bet
     <a class="logo" href="#/"><span class="mark"><svg width="18" height="18" viewBox="0 0 24 24" fill="#fff"><path d="M15.5 3.2A9 9 0 1 0 20.8 15 7 7 0 0 1 15.5 3.2z"/><circle cx="18.5" cy="5.5" r="1.6"/></svg></span><span id="brand">Moralume</span></a>
     <nav class="links">
       <a href="#/" data-route="">Explore</a>
+      <a href="#/swap" data-route="swap">Swap</a>
       <a href="#/create" data-route="create">Launch a token</a>
+      <a href="#/earnings" data-route="earnings">Earnings</a>
       <a href="#/wallet" data-route="wallet">ETH ⇄ WETH</a>
     </nav>
     <div class="spacer"></div>
+    <a id="faucet" class="btn ghost small faucet" href="https://faucet.giwa.io" target="_blank" rel="noopener noreferrer" title="Get free GIWA Sepolia test ETH">💧<span class="ftext"> Get test ETH</span></a>
     <span id="net" class="netpill">GIWA Sepolia</span>
     <button id="connect" class="btn dark">Connect wallet</button>
   </div>
