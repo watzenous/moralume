@@ -8,11 +8,15 @@ Built for the Ammora Builder Mission: *"Ship an exchange or launchpad with the A
 
 ## Features
 
-- **🚀 Launch:** One transaction creates an ERC-20 token and its Ammora bonding curve. Name, ticker, description, links and image are stored on-chain.
+- **🚀 Launch:** One transaction creates an ERC-20 token and its Ammora bonding curve. Name, ticker, description, links and image are stored on-chain, within Ammora's 2 KB metadata limit.
+- **🛡️ Anti-snipe first buy:** An optional initial buy runs in the same transaction as the launch, through Ammora's FirstBuyExecutor, so nobody can buy before the creator.
 - **📈 Trade:** Buy and sell on the bonding curve, with live quotes, slippage control, automatic ETH→WETH wrapping and exact-amount approvals.
 - **🎓 Graduate:** When the curve fills, anyone can migrate it into a permanent Ammora ARL pool, where trading continues.
+- **🔄 Swap (exchange):** ETH ⇄ any Ammora token, or token ⇄ token through WETH. Each leg routes to the bonding curve or the graduated ARL pool automatically.
+- **💰 Earnings:** Creators and partners claim their trading-fee share from the Ammora FeeVault and the fees earned by graduated LP position NFTs.
 - **🔍 Explore:** Every Ammora launch on GIWA, with price, market cap, curve progress, a price chart and trade history.
-- **👛 Wallet:** Connect, switch or disconnect any browser wallet (MetaMask etc.).
+- **✅ Official badge:** Tokens launched by the Moralume wallet are verified on-chain by creator address and pinned to the top.
+- **👛 Wallet:** Connect, switch or disconnect any browser wallet. A faucet button links to free testnet ETH.
 - **🔒 Static and private:** No backend, no API keys, no trackers. A strict CSP allows only the GIWA RPC and explorer.
 
 ## Ammora SDK usage
@@ -22,9 +26,12 @@ Built for the Ammora Builder Mission: *"Ship an exchange or launchpad with the A
 | Deployment and contracts | `giwaSepoliaAutoRouteDeployment`, `verifyAmmoraV4CoreAtBlock` |
 | Launch Config | `getAmmoraV4ConfigAtBlock` |
 | Token launch | `buildCreateAmmoraV4Launch`, `parseAmmoraV4LaunchCreatedReceipt` |
+| Atomic launch + first buy | `AmmoraPortableLifecyclePlanner.planExistingConfigAtomicFirstBuy`, `verifyAmmoraPortableDeploymentAtBlock`, `giwaSepoliaAtomicLaunchTargets` |
 | Curve trading | `AmmoraV4LaunchCurveClient` (`quoteExactInputAtBlock`, `planSwapExactInput`), `classifyAmmoraV4ExactInputFill` |
 | Graduation | `AmmoraV4LaunchCurveClient.planMigrateAtBlock` |
-| Post-graduation swaps | `AmmoraSwapClient.prepareExactIn` |
+| Pool swaps and Swap page | `AmmoraSwapClient.prepareExactIn` |
+| Launch-fee claims | `feeVaultAbi`, `buildClaimFeeVaultFor` |
+| LP fee claims | `DammV2Client.planClaimManagedConcentratedFees`, `ammConcentratedPositionManagerV3Abi` |
 | Launch discovery | `ammoraLaunchFactoryV4Abi` (`LaunchCreated`), `ammoraLaunchPoolV4Abi` |
 
 Moralume uses its own launch Config **#67** (partner fee recipient: the Moralume wallet).
@@ -55,6 +62,8 @@ Edit `src/config.js`, then run `npm run build` again and re-upload `dist/`.
 
 - `launchConfigId`: the Ammora launch Config every new token uses (Moralume: **#67**).
 - `hiddenTokens`: token or curve addresses to hide from the site (moderation).
+- `officialCreators` / `officialTokens`: who gets the ✓ Official badge.
+- `faucetUrl`: target of the "Get test ETH" header button.
 - `links`, `defaultSlippageBps`: footer links and default slippage.
 
 ## What the site connects to at runtime
