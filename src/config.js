@@ -11,6 +11,17 @@ export const SITE = {
   // graduates at 0.05 WETH.
   launchConfigId: 67n,
 
+  // Launch types on the "Launch a token" page. The first one is the default.
+  // "Anti-sniper": create its Config once on the hidden #/setup page with the owner wallet,
+  // then paste the new ID below (keep the trailing n) and rebuild.
+  launchPresets: [
+    { id: 67n, name: "Standard", description: "Flat 1% trading fee from the first second." },
+    { id: 72n, name: "Anti-sniper", antiSniper: true,
+      description: "Launch fee starts at 20% and drops 1% every 15 seconds, reaching 1% after about 5 minutes. Bots that buy at launch pay up to 20%." },
+  ],
+  // Fee schedule #/setup uses to create the Anti-sniper Config (Ammora V4 linear fee scheduler).
+  antiSniper: { cliffFeeBps: 2000, reductionBps: 100, periods: 19, periodSeconds: 15 },
+
   // Moderation: token or curve addresses listed here are hidden everywhere on this site
   // (explore list and token page). On-chain data is untouched; this only affects Moralume.
   // Example: hiddenTokens: ["0x1234…", "0xabcd…"],

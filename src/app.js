@@ -45,6 +45,13 @@ const wethAbi = [
 ];
 
 const siteConfigId = () => BigInt(SITE.launchConfigId);
+// Launch presets (Standard, Anti-sniper, …). Presets without an id are not created yet and stay hidden.
+const PRESETS = ((SITE.launchPresets && SITE.launchPresets.length) ? SITE.launchPresets : [{ id: SITE.launchConfigId, name: "Standard" }])
+  .filter((p) => p.id !== null && p.id !== undefined).map((p) => ({ ...p, id: BigInt(p.id) }));
+const SITE_CONFIGS = new Set([siteConfigId(), ...PRESETS.map((p) => p.id)].map(String));
+const isSiteConfig = (cid) => cid !== undefined && cid !== null && SITE_CONFIGS.has(String(cid));
+const presetFor = (cid) => PRESETS.find((p) => String(p.id) === String(cid));
+const shieldBadge = (cid) => (presetFor(cid)?.antiSniper ? `<span class="badge b-shield" title="Anti-sniper launch: high fee at launch that decays to 1%">🛡 Anti-sniper</span>` : "");
 // Moderation: tokens listed in SITE.hiddenTokens (token or curve address) are not shown anywhere on this site.
 const HIDDEN = new Set((SITE.hiddenTokens || []).map((a) => String(a).toLowerCase()));
 const isHidden = (...addrs) => addrs.some((a) => a && HIDDEN.has(String(a).toLowerCase()));
@@ -55,6 +62,26 @@ const isOfficial = (x) => !!x && (OFFICIAL_TOKENS.size
   ? [x.token, x.curve].some((a) => a && OFFICIAL_TOKENS.has(String(a).toLowerCase()))
   : !!x.creator && OFFICIAL_CREATORS.has(String(x.creator).toLowerCase()));
 const officialBadge = (x) => (isOfficial(x) ? `<span class="badge b-official" title="Launched by the ${esc(SITE.name)} team">✓ Official</span>` : "");
+
+/* ───────────────────────────── night mode ───────────────────────────── */
+// Saved choice wins; otherwise follow the operating system setting.
+const THEME_KEY = "moralume.theme";
+const MOON_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11z"/></svg>`;
+const SUN_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></svg>`;
+const savedTheme = () => { try { return localStorage.getItem(THEME_KEY); } catch { return null; } };
+const systemDark = () => window.matchMedia?.("(prefers-color-scheme: dark)").matches;
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  const b = document.getElementById("theme");
+  if (b) { b.innerHTML = theme === "dark" ? SUN_ICON : MOON_ICON; b.title = theme === "dark" ? "Switch to day mode" : "Switch to night mode"; }
+}
+applyTheme(savedTheme() || (systemDark() ? "dark" : "light"));
+window.matchMedia?.("(prefers-color-scheme: dark)").addEventListener?.("change", (e) => { if (!savedTheme()) applyTheme(e.matches ? "dark" : "light"); });
+document.getElementById("theme")?.addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  try { localStorage.setItem(THEME_KEY, next); } catch {}
+  applyTheme(next);
+});
 
 /* ───────────────────────────── small helpers ───────────────────────────── */
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -101,6 +128,8 @@ const errText = (e) => {
   return reason ? `${base} (${reason})` : base;
 };
 function toast(html, kind = "", ms = 6000) {
+  // Don't stack the same message again and again (e.g. repeated clicks).
+  for (const t of $("#toasts").children) if (t.innerHTML === html) { t.remove(); }
   const el = document.createElement("div");
   el.className = `toast ${kind}`;
   el.innerHTML = html;
@@ -144,31 +173,102 @@ async function readMetadata(uri) {
 
 /* ───────────────────────────── wallet ───────────────────────────── */
 const W = { address: null, chainId: null, wc: null };
-const eth = () => window.ethereum;
+
+// Wallet discovery (EIP-6963): every installed wallet extension announces itself, so visitors with
+// several wallets (MetaMask + OKX + Phantom + Rabby …) can pick one instead of whichever extension
+// grabbed window.ethereum. That "winner" is often a wallet with EVM disabled or locked, and it
+// rejects every request instantly without showing a popup.
+const WALLETS = []; // { info: { uuid, name, icon, rdns }, provider }
+const WALLET_KEY = "moralume.wallet";
+window.addEventListener("eip6963:announceProvider", (e) => {
+  const d = e.detail;
+  if (!d?.info?.rdns || !d.provider?.request) return;
+  if (!WALLETS.some((w) => w.info.rdns === d.info.rdns)) WALLETS.push(d);
+});
+window.dispatchEvent(new Event("eip6963:requestProvider"));
+const savedWallet = () => { try { return localStorage.getItem(WALLET_KEY); } catch { return null; } };
+let current = null; // the provider in use
+const eth = () => current || WALLETS.find((w) => w.info.rdns === savedWallet())?.provider || window.ethereum;
 
 // "Disconnected" is remembered so the site does not silently re-attach the wallet on reload.
 const DISCONNECTED = "moralume.walletDisconnected";
 const setDisconnected = (v) => { try { v ? localStorage.setItem(DISCONNECTED, "1") : localStorage.removeItem(DISCONNECTED); } catch {} };
 const isDisconnected = () => { try { return localStorage.getItem(DISCONNECTED) === "1"; } catch { return false; } };
 
+const onAccounts = (a) => {
+  if (isDisconnected()) return;
+  W.address = a?.[0] ? getAddress(a[0]) : null;
+  W.wc = W.address ? createWalletClient({ chain, transport: custom(eth()) }) : null;
+  renderHeader(); render();
+};
+const onChain = (c) => { W.chainId = Number(c); renderHeader(); };
+let listening = null;
+function useProvider(p) {
+  if (listening && listening !== p) { listening.removeListener?.("accountsChanged", onAccounts); listening.removeListener?.("chainChanged", onChain); }
+  current = p;
+  if (p && listening !== p) { p.on?.("accountsChanged", onAccounts); p.on?.("chainChanged", onChain); listening = p; }
+}
+
+// Wallet picker: shown when more than one wallet is installed.
+function pickWallet() {
+  return new Promise((resolve, reject) => {
+    const bg = document.createElement("div");
+    bg.className = "modal-bg";
+    const icon = (w) => /^data:image\/(png|jpe?g|gif|webp|svg\+xml)[;,]/i.test(w.info.icon || "")
+      ? `<img src="${esc(w.info.icon)}" alt="" />` : `<span>${esc((w.info.name || "?").slice(0, 1))}</span>`;
+    bg.innerHTML = `<div class="modal"><h3>Connect a wallet</h3>
+      <div class="muted" style="margin-bottom:12px">Choose the wallet you want to use on ${esc(SITE.name)}.</div>
+      <div class="wlist">${WALLETS.map((w, i) => `<button class="wopt" data-i="${i}">${icon(w)}<b>${esc(w.info.name || w.info.rdns)}</b>
+        ${w.info.rdns === savedWallet() ? '<em>Last used</em>' : ""}</button>`).join("")}</div>
+      <button class="btn ghost block" data-x style="margin-top:12px">Cancel</button></div>`;
+    const close = () => bg.remove();
+    bg.onclick = (e) => {
+      const o = e.target.closest(".wopt");
+      if (o) { close(); resolve(WALLETS[Number(o.dataset.i)]); }
+      else if (e.target === bg || e.target.closest("[data-x]")) { close(); reject(Object.assign(new Error("cancelled"), { cancelled: true })); }
+    };
+    document.body.appendChild(bg);
+  });
+}
+
 async function connect(pickAccount = false) {
-  if (!eth()) {
+  await sleep(0); // let wallets finish announcing themselves
+  const saved = WALLETS.find((w) => w.info.rdns === savedWallet());
+  let chosen = null;
+  if (WALLETS.length > 1) chosen = await pickWallet(); // always let the visitor choose; last used is marked
+  else chosen = saved || WALLETS[0] || null;
+  const p = chosen?.provider || window.ethereum;
+  if (!p) {
     toast('No browser wallet found. Install <a href="https://metamask.io" target="_blank" rel="noopener noreferrer">MetaMask</a> or another EVM wallet.', "err", 9000);
     throw new Error("No wallet");
   }
-  // After a disconnect (or on "Switch wallet") ask the wallet to show its account picker again.
-  if (pickAccount || isDisconnected()) {
-    try { await eth().request({ method: "wallet_requestPermissions", params: [{ eth_accounts: {} }] }); }
-    catch (e) { if (e.code === 4001) throw e; /* wallet without this method: fall back below */ }
+  useProvider(p);
+  if (chosen) { try { localStorage.setItem(WALLET_KEY, chosen.info.rdns); } catch {} }
+  const started = Date.now();
+  try {
+    // After a disconnect (or on "Switch wallet") ask the wallet to show its account picker again.
+    // Not every wallet supports this, so any failure just falls through to eth_requestAccounts.
+    if (pickAccount || isDisconnected()) {
+      try { await p.request({ method: "wallet_requestPermissions", params: [{ eth_accounts: {} }] }); } catch {}
+    }
+    const [addr] = await p.request({ method: "eth_requestAccounts" });
+    if (!addr) throw new Error("No account selected in your wallet.");
+    setDisconnected(false);
+    W.address = getAddress(addr);
+    W.chainId = Number(await p.request({ method: "eth_chainId" }));
+    W.wc = createWalletClient({ chain, transport: custom(p) });
+    renderHeader();
+    return W.address;
+  } catch (e) {
+    // A rejection that comes back almost instantly never showed a popup: the wallet is locked,
+    // has EVM turned off, or another extension answered. Say so instead of "you rejected it".
+    if (e?.code === 4001 && Date.now() - started < 700) {
+      const name = chosen?.info?.name || "Your wallet";
+      throw new Error(`${name} refused without opening a popup. Unlock it, make sure it supports EVM networks${WALLETS.length > 1 ? ", or click Connect wallet and pick another wallet" : ""}.`);
+    }
+    if (e?.code === -32002) throw new Error("A connection request is already open in your wallet. Open the wallet extension to approve it.");
+    throw e;
   }
-  const [addr] = await eth().request({ method: "eth_requestAccounts" });
-  if (!addr) throw new Error("No account selected in your wallet.");
-  setDisconnected(false);
-  W.address = getAddress(addr);
-  W.chainId = Number(await eth().request({ method: "eth_chainId" }));
-  W.wc = createWalletClient({ chain, transport: custom(eth()) });
-  renderHeader();
-  return W.address;
 }
 async function disconnect() {
   // Revoke this site's account permission where the wallet supports it (MetaMask does);
@@ -201,23 +301,20 @@ async function ensureWallet() {
   await ensureChain();
   return W.address;
 }
-if (eth()) {
-  eth().on?.("accountsChanged", (a) => {
-    if (isDisconnected()) return;
-    W.address = a?.[0] ? getAddress(a[0]) : null;
-    if (W.address && !W.wc) W.wc = createWalletClient({ chain, transport: custom(eth()) });
-    renderHeader(); render();
-  });
-  eth().on?.("chainChanged", (c) => { W.chainId = Number(c); renderHeader(); });
-  eth().request({ method: "eth_accounts" }).then(async (a) => {
-    if (a?.[0] && !isDisconnected()) {
+// Silent reconnect on page load (no popup): only if the wallet already trusts this site.
+setTimeout(() => {
+  const p = eth();
+  if (!p || isDisconnected()) return;
+  useProvider(p);
+  p.request({ method: "eth_accounts" }).then(async (a) => {
+    if (a?.[0] && !isDisconnected() && !W.address) {
       W.address = getAddress(a[0]);
-      W.chainId = Number(await eth().request({ method: "eth_chainId" }));
-      W.wc = createWalletClient({ chain, transport: custom(eth()) });
+      W.chainId = Number(await p.request({ method: "eth_chainId" }));
+      W.wc = createWalletClient({ chain, transport: custom(p) });
       renderHeader(); render();
     }
   }).catch(() => {});
-}
+}, 50);
 
 function renderHeader() {
   const f = $("#faucet");
@@ -230,7 +327,8 @@ function renderHeader() {
   const net = $("#net");
   const wrong = W.address && W.chainId !== CHAIN_ID;
   net.className = "netpill" + (wrong ? " wrong" : "");
-  net.textContent = wrong ? "Switch to GIWA Sepolia" : "GIWA Sepolia";
+  net.innerHTML = wrong ? `<i class="dot"></i><b>Wrong network</b><span>Switch</span>` : `<i class="dot"></i><b>GIWA</b><span>Testnet</span>`;
+  net.title = wrong ? "Click to switch to GIWA Sepolia" : "GIWA Sepolia testnet";
   const route = (location.hash.replace(/^#\/?/, "").split("/")[0]) || "";
   document.querySelectorAll(".links a").forEach((a) => a.classList.toggle("active", a.dataset.route === route));
 }
@@ -256,7 +354,7 @@ function openWalletMenu() {
     if (act === "earnings") { closeWalletMenu(); location.hash = "#/earnings"; }
     if (act === "copy") { try { await navigator.clipboard.writeText(W.address); toast("Address copied."); } catch { toast("Could not copy.", "err"); } closeWalletMenu(); }
     if (act === "explorer") { window.open(addrUrl(W.address), "_blank", "noopener,noreferrer"); closeWalletMenu(); }
-    if (act === "switch") { closeWalletMenu(); try { await connect(true); await ensureChain(); render(); } catch (e) { if (e.message !== "No wallet") toast(esc(errText(e)), "err"); } }
+    if (act === "switch") { closeWalletMenu(); try { await connect(true); await ensureChain(); render(); } catch (e) { if (e.message !== "No wallet" && !e.cancelled) toast(esc(errText(e)), "err"); } }
     if (act === "disconnect") await disconnect();
   }));
 }
@@ -265,7 +363,7 @@ window.addEventListener("hashchange", closeWalletMenu);
 
 $("#connect").onclick = async () => {
   if (W.address) { $("#wmenu") ? closeWalletMenu() : openWalletMenu(); return; }
-  try { await connect(); await ensureChain(); render(); } catch (e) { if (e.message !== "No wallet") toast(esc(errText(e)), "err"); }
+  try { await connect(); await ensureChain(); render(); } catch (e) { if (e.message !== "No wallet" && !e.cancelled) toast(esc(errText(e)), "err"); }
 };
 $("#net").onclick = () => { if (W.address && W.chainId !== CHAIN_ID) ensureChain().catch((e) => toast(esc(errText(e)), "err")); };
 
@@ -501,10 +599,9 @@ async function viewExplore(id) {
   let list = [];
   const draw = () => {
     if (id !== renderId) return;
-    const cfg = siteConfigId();
     const q = ui.q.trim().toLowerCase();
     let rows = list.filter((x) => x.status !== undefined && !isHidden(x.token, x.curve));
-    if (ui.tab === "site") rows = rows.filter((x) => x.configId === cfg);
+    if (ui.tab === "site") rows = rows.filter((x) => isSiteConfig(x.configId));
     if (ui.tab === "live") rows = rows.filter((x) => x.status === 1);
     if (ui.tab === "ready") rows = rows.filter((x) => x.status === 2);
     if (ui.tab === "grad") rows = rows.filter((x) => x.status === 3);
@@ -512,7 +609,7 @@ async function viewExplore(id) {
     if (q) rows = rows.filter((x) => [x.name, x.symbol, x.token, x.curve, x.meta?.name].some((s) => String(s || "").toLowerCase().includes(q)));
     const g = $("#grid");
     if (!rows.length) {
-      g.innerHTML = `<div class="empty">${ui.tab === "site" ? `No tokens on this launchpad's Config #${cfg} yet. <a href="#/create">Launch the first one →</a>` : ui.tab === "mine" && !W.address ? "Connect your wallet to see your launches." : "Nothing here yet."}</div>`;
+      g.innerHTML = `<div class="empty">${ui.tab === "site" ? `No tokens on this launchpad yet. <a href="#/create">Launch the first one →</a>` : ui.tab === "mine" && !W.address ? "Connect your wallet to see your launches." : "Nothing here yet."}</div>`;
       return;
     }
     rows = [...rows.filter(isOfficial), ...rows.filter((x) => !isOfficial(x))];
@@ -520,7 +617,7 @@ async function viewExplore(id) {
       <a class="card lcard" href="#/token/${x.curve}">
         <div class="lhead">${avatar(x)}
           <div style="min-width:0;flex:1"><div class="lname">${esc(x.name || x.meta?.name || "Unnamed")}</div><div class="lsym">$${esc(x.symbol || x.meta?.symbol || "")} ${officialBadge(x)}</div></div>
-          <div style="display:grid;gap:4px;justify-items:end">${statusBadge(x.status)}${x.configId === cfg ? `<span class="badge b-site">${esc(SITE.name)}</span>` : ""}</div>
+          <div style="display:grid;gap:4px;justify-items:end">${statusBadge(x.status)}${isSiteConfig(x.configId) ? `<span class="badge b-site">${esc(SITE.name)}</span>` : ""}${shieldBadge(x.configId)}</div>
         </div>
         <div class="ldesc">${esc(x.meta?.description || `Created by ${short(x.creator)} · Config #${x.configId}`)}</div>
         <div class="row"><span class="muted">Market cap</span><b>${fmtNum(x.mcap)} ETH</b></div>
@@ -539,14 +636,14 @@ async function viewExplore(id) {
     const live = visible.filter((x) => x.status === 1).length;
     const grad = visible.filter((x) => x.status === 3).length;
     const tvl = visible.filter((x) => x.status === 1).reduce((s, x) => s + Number(formatUnits(x.quoteReserve ?? 0n, 18)), 0);
-    const site = list.filter((x) => x.configId === siteConfigId()).length;
+    const site = list.filter((x) => isSiteConfig(x.configId)).length;
     $("#stats").innerHTML = [["Ammora launches", visible.length], ["Live curves", live], ["Graduated", grad], ["WETH in curves", fmtNum(tvl)], ["On " + SITE.name, site]]
       .slice(0, 4).map(([k, v]) => `<div class="stat"><div class="k">${esc(k)}</div><div class="v">${v}</div></div>`).join("");
   };
   bind();
   try {
     list = await loadLaunches();
-    if (ui.tab === "site" && !list.some((x) => x.configId === siteConfigId())) ui.tab = "all";
+    if (ui.tab === "site" && !list.some((x) => isSiteConfig(x.configId))) ui.tab = "all";
     if (id !== renderId) return;
     document.querySelectorAll("#tabs button").forEach((y) => y.classList.toggle("on", y.dataset.k === ui.tab));
     stats(); draw();
@@ -556,10 +653,15 @@ async function viewExplore(id) {
 }
 
 /* ───────────────────────────── views: token page ───────────────────────────── */
-let swapClientPromise = null;
-const swapClient = () => (swapClientPromise ??= A.AmmoraSwapClient.create(pc, {
-  deploymentCatalog: { [CHAIN_ID]: D }, factoryProfiles: A.giwaSepoliaAutoRoutePoolProfiles,
-}));
+// AmmoraSwapClient (the multi-venue swap router) is most of the SDK's code but is only needed for
+// graduated tokens, so it is built as a separate file that is loaded on demand (and prefetched when idle).
+// SWAP_MODULE is filled in by build.mjs with the hashed file name.
+const SWAP_MODULE = typeof __SWAP_MODULE__ === "string" ? __SWAP_MODULE__ : "./swap-client.js";
+let swapClientPromise = null, swapModulePromise = null;
+const loadSwapModule = () => (swapModulePromise ??= import(SWAP_MODULE).catch((e) => { swapModulePromise = null; throw e; }));
+const swapClient = () => (swapClientPromise ??= loadSwapModule()
+  .then((m) => m.createSwapClient({ chain, rpc: RPC }))
+  .catch((e) => { swapClientPromise = null; throw e; }));
 
 async function launchInfo(curve) {
   const cached = launchCache.list.find((x) => x.curve === curve);
@@ -626,7 +728,7 @@ async function viewToken(id, curveParam) {
       <div class="card panel">
         <div class="thead">${avatar(x, "lg")}
           <div style="flex:1;min-width:0"><h2>${esc(tok.name)} <span class="muted" style="font-size:18px">$${esc(tok.symbol)}</span> ${officialBadge({ token: st.baseToken, curve, creator: info?.creator || st.creator })}</h2>
-          <div style="display:flex;gap:6px;align-items:center;margin-top:4px;flex-wrap:wrap">${statusBadge(st.status)}${st.configId === siteConfigId() ? `<span class="badge b-site">${esc(SITE.name)}</span>` : ""}<span class="muted" style="font-size:13px">Config #${st.configId} · fee ${(st.currentFeeBps / 100).toFixed(2)}%</span></div></div>
+          <div style="display:flex;gap:6px;align-items:center;margin-top:4px;flex-wrap:wrap">${statusBadge(st.status)}${isSiteConfig(st.configId) ? `<span class="badge b-site">${esc(SITE.name)}</span>` : ""}${shieldBadge(st.configId)}<span class="muted" style="font-size:13px">Config #${st.configId} · fee ${(st.currentFeeBps / 100).toFixed(2)}%</span></div></div>
         </div>
         ${meta.description ? `<p class="ink2" style="margin:14px 0 0;white-space:pre-wrap">${esc(meta.description)}</p>` : ""}
         ${links.length ? `<div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">${links.map(([t, u]) => `<a class="btn ghost small" href="${esc(safeUrl(u))}" target="_blank" rel="noopener noreferrer nofollow">${t} ↗</a>`).join("")}</div>` : ""}
@@ -640,6 +742,7 @@ async function viewToken(id, curveParam) {
           <div class="row" style="margin-bottom:6px"><span class="muted">Bonding curve progress — graduates at ${fmtUnits(st.migrationQuoteThreshold, 18)} WETH</span><b>${(Math.min(1, progress) * 100).toFixed(2)}%</b></div>
           <div class="bar" style="height:12px"><i style="width:${(Math.min(1, progress) * 100).toFixed(2)}%"></i></div>
         </div>
+        ${presetFor(st.configId)?.antiSniper && st.status === 1 && st.currentFeeBps > 100 ? `<div class="alert warn" style="margin-top:12px">🛡 Anti-sniper launch: the trading fee is <b>${(st.currentFeeBps / 100).toFixed(0)}%</b> right now and drops 1% every 15 seconds until it reaches 1%. Refresh to see the current fee.</div>` : ""}
         <svg class="chart" id="chart" viewBox="0 0 700 220" preserveAspectRatio="none"></svg>
         <div class="addr">
           <div><span>Token</span> <a class="mono" href="${addrUrl(st.baseToken)}" target="_blank" rel="noopener">${short(st.baseToken)}</a></div>
@@ -1049,7 +1152,7 @@ async function viewSwap(id, preselect) {
     $("#pclose", bg).onclick = close;
     const other = which === "from" ? swapState.to : swapState.from;
     const cfg = siteConfigId();
-    const sorted = [...tradable].sort((a, b) => isOfficial(b) - isOfficial(a) || (b.configId === cfg) - (a.configId === cfg) || (b.mcap || 0) - (a.mcap || 0));
+    const sorted = [...tradable].sort((a, b) => isOfficial(b) - isOfficial(a) || isSiteConfig(b.configId) - isSiteConfig(a.configId) || (b.mcap || 0) - (a.mcap || 0));
     const render_ = () => {
       const q = $("#pq", bg).value.trim().toLowerCase();
       const rows = [ETH_ASSET, ...sorted.map(assetFromLaunch)]
@@ -1125,9 +1228,10 @@ async function viewSwap(id, preselect) {
 // A fresh curve's first buy is fully determined by its Config, so the expected output can be
 // computed exactly (checked against live fresh curves to the wei) for plain-fee Configs.
 function atomicFirstBuyEligible(c) {
+  // A decaying fee schedule is fine: inside the launch transaction no time has passed, so the
+  // fee is exactly cliffFeeBps (unless the first-swap-min-fee option overrides it).
   return !!c && !c.dynamicFeeEnabled && !c.rateLimiterEnabled && !c.enableFirstSwapWithMinFee
-    && Number(c.feeSchedulerMode) === 0 && Number(c.feeNumberOfPeriods) === 0 && Number(c.collectFeeMode) === 0
-    && Number(c.activationDelay) === 0;
+    && Number(c.collectFeeMode) === 0 && Number(c.activationDelay) === 0;
 }
 function freshCurveBuyQuote(config, segments, amountIn) {
   const Q2 = 1n << 128n;
@@ -1159,7 +1263,7 @@ async function viewEarnings(id) {
     app.innerHTML = `<div class="formcard card" style="max-width:560px"><span class="chip">💰 Earnings</span><h2 style="margin-top:12px">Your earnings</h2>
       <div class="muted">Connect your wallet to see and claim the fees you earned as a token creator, as a launchpad partner, or from graduated liquidity positions.</div>
       <button class="btn grad block" id="econnect" style="margin-top:16px">Connect wallet</button></div>`;
-    $("#econnect").onclick = async () => { try { await connect(); await ensureChain(); render(); } catch (e) { if (e.message !== "No wallet") toast(esc(errText(e)), "err"); } };
+    $("#econnect").onclick = async () => { try { await connect(); await ensureChain(); render(); } catch (e) { if (e.message !== "No wallet" && !e.cancelled) toast(esc(errText(e)), "err"); } };
     return;
   }
   const me = W.address;
@@ -1266,12 +1370,15 @@ let coreVerified = null;
 const verifyCore = async (bn) => (coreVerified ??= A.verifyAmmoraV4CoreAtBlock(pc, CORE, bn).catch((e) => { coreVerified = null; throw e; }));
 
 async function viewCreate(id) {
-  const cfgId = siteConfigId();
+  let cfgId = PRESETS[0]?.id ?? siteConfigId();
   app.innerHTML = `
   <div class="formcard card">
     <span class="chip">🚀 New launch</span>
     <h2 style="margin-top:12px">Launch a token</h2>
-    <div class="muted">Creates a new ERC-20 and its Ammora bonding curve in one transaction, using ${esc(SITE.name)}'s launch Config #${cfgId}.</div>
+    <div class="muted">Creates a new ERC-20 and its Ammora bonding curve in one transaction, on ${esc(SITE.name)}'s Ammora launch Config.</div>
+    ${PRESETS.length > 1 ? `<label class="l" style="margin-top:16px">Launch type</label>
+    <div class="presets" id="presets">${PRESETS.map((p, i) => `<button type="button" class="preset ${i === 0 ? "on" : ""}" data-i="${i}">
+      <b>${p.antiSniper ? "🛡 " : ""}${esc(p.name)}</b><span>${esc(p.description || "")}</span></button>`).join("")}</div>` : ""}
     <div id="cfginfo" class="preview"><div class="skel" style="height:18px"></div><div class="skel" style="height:18px"></div></div>
     <div class="fgrid">
       <div><label class="l">Name</label><input class="inp" id="name" maxlength="40" placeholder="Moon Cat"/></div>
@@ -1284,7 +1391,7 @@ async function viewCreate(id) {
       <div><label class="l">Website (optional)</label><input class="inp" id="web" placeholder="https://"/></div>
       <div><label class="l">X / Twitter (optional)</label><input class="inp" id="tw" placeholder="https://x.com/…"/></div>
       <div><label class="l">Telegram (optional)</label><input class="inp" id="tg" placeholder="https://t.me/…"/></div>
-      <div><label class="l">Initial buy in ETH (optional)</label><input class="inp" id="first" inputmode="decimal" placeholder="0.001"/><div class="help">Bought in the same transaction as the launch, so nobody can buy before you. ETH is wrapped to WETH automatically.</div></div>
+      <div><label class="l">Initial buy in ETH (optional)</label><input class="inp" id="first" inputmode="decimal" placeholder="0.001"/><div class="help" id="firsthelp">Bought in the same transaction as the launch, so nobody can buy before you. ETH is wrapped to WETH automatically.</div></div>
     </div>
     <div id="cmsg"></div>
     <button class="btn grad block" id="launch" style="margin-top:16px">${W.address ? "Launch token" : "Connect wallet & launch"}</button>
@@ -1292,22 +1399,40 @@ async function viewCreate(id) {
   </div>`;
 
   let cfg = null, imgBmp = null, fitted = null;
-  try {
-    const bn = await pc.getBlockNumber();
-    cfg = await A.getAmmoraV4ConfigAtBlock(pc, L.configRegistry, cfgId, bn);
-    if (id !== renderId) return;
-    const c = cfg.config;
-    $("#cfginfo").innerHTML = `
-      <div><span class="muted">Config</span> <b>#${cfgId}</b> ${cfg.enabled ? '<span class="good">enabled</span>' : '<span class="bad">disabled</span>'}</div>
-      <div><span class="muted">Creation fee</span> <b>${formatUnits(c.poolCreationFee, 18)} ETH</b></div>
-      <div><span class="muted">Total supply</span> <b>${fmtUnits(c.totalSupply, c.tokenDecimals)}</b> (${c.tokenDecimals} decimals)</div>
-      <div><span class="muted">Graduates at</span> <b>${fmtUnits(c.migrationQuoteThreshold, 18)} WETH</b></div>
-      <div><span class="muted">Curve fee</span> <b>${(c.cliffFeeBps / 100).toFixed(2)}%</b> · creator share ${(c.creatorShareOfNonProtocolBps / 100).toFixed(0)}%</div>
-      <div><span class="muted">Partner</span> <a class="mono" href="${addrUrl(c.partnerRecipient)}" target="_blank" rel="noopener">${short(c.partnerRecipient)}</a></div>`;
-    if (!cfg.enabled) $("#cmsg").innerHTML = `<div class="alert err">Config #${cfgId} is disabled. Update <span class="mono">launchConfigId</span> in src/config.js.</div>`;
-  } catch (e) {
-    if (id === renderId) $("#cfginfo").innerHTML = `<div class="alert err" style="grid-column:1/-1">Could not read Config #${cfgId}: ${esc(errText(e))}</div>`;
-  }
+  const loadCfg = async () => {
+    const want = cfgId;
+    $("#cmsg").innerHTML = "";
+    $("#cfginfo").innerHTML = `<div class="skel" style="height:18px"></div><div class="skel" style="height:18px"></div>`;
+    try {
+      const bn = await pc.getBlockNumber();
+      const entry = await A.getAmmoraV4ConfigAtBlock(pc, L.configRegistry, want, bn);
+      if (id !== renderId || want !== cfgId) return;
+      cfg = entry;
+      const c = cfg.config;
+      const sched = Number(c.feeSchedulerMode) !== 0;
+      const endFee = sched ? Number(c.cliffFeeBps) - (Number(c.feeSchedulerMode) === 1 ? Number(c.feeReductionFactorBps) * Number(c.feeNumberOfPeriods) : 0) : Number(c.cliffFeeBps);
+      $("#cfginfo").innerHTML = `
+        <div><span class="muted">Config</span> <b>#${want}</b> ${cfg.enabled ? '<span class="good">enabled</span>' : '<span class="bad">disabled</span>'}</div>
+        <div><span class="muted">Creation fee</span> <b>${formatUnits(c.poolCreationFee, 18)} ETH</b></div>
+        <div><span class="muted">Total supply</span> <b>${fmtUnits(c.totalSupply, c.tokenDecimals)}</b> (${c.tokenDecimals} decimals)</div>
+        <div><span class="muted">Graduates at</span> <b>${fmtUnits(c.migrationQuoteThreshold, 18)} WETH</b></div>
+        <div><span class="muted">Curve fee</span> <b>${sched && Number(c.feeSchedulerMode) === 1 ? `${(c.cliffFeeBps / 100).toFixed(0)}% → ${(endFee / 100).toFixed(0)}% over ${Math.round(Number(c.feeNumberOfPeriods) * Number(c.feePeriodFrequency) / 60)} min` : `${(c.cliffFeeBps / 100).toFixed(2)}%`}</b> · creator share ${(c.creatorShareOfNonProtocolBps / 100).toFixed(0)}%</div>
+        <div><span class="muted">Partner</span> <a class="mono" href="${addrUrl(c.partnerRecipient)}" target="_blank" rel="noopener">${short(c.partnerRecipient)}</a></div>`;
+      $("#firsthelp").innerHTML = sched
+        ? `Bought in the same transaction as the launch. On an anti-sniper launch this first buy also pays the <b>${(c.cliffFeeBps / 100).toFixed(0)}% launch fee</b>, so keep it small or skip it.`
+        : "Bought in the same transaction as the launch, so nobody can buy before you. ETH is wrapped to WETH automatically.";
+      if (!cfg.enabled) $("#cmsg").innerHTML = `<div class="alert err">Config #${want} is disabled. Update the launch presets in src/config.js.</div>`;
+    } catch (e) {
+      if (id === renderId && want === cfgId) $("#cfginfo").innerHTML = `<div class="alert err" style="grid-column:1/-1">Could not read Config #${want}: ${esc(errText(e))}</div>`;
+    }
+  };
+  document.querySelectorAll("#presets .preset").forEach((b) => (b.onclick = () => {
+    document.querySelectorAll("#presets .preset").forEach((x) => x.classList.toggle("on", x === b));
+    cfgId = PRESETS[Number(b.dataset.i)].id;
+    cfg = null;
+    loadCfg();
+  }));
+  await loadCfg();
 
   const setPrev = (src) => { $("#imgprev").outerHTML = src ? `<img id="imgprev" class="avatar lg" src="${esc(src)}" alt="">` : `<div id="imgprev" class="avatar lg">?</div>`; };
   const baseMeta = () => ({
@@ -1514,6 +1639,51 @@ async function viewWallet(id) {
   $("#unwrap").onclick = () => act(false);
 }
 
+/* ───────────────────────────── views: owner setup (hidden, #/setup) ───────────────────────────── */
+// One-time owner tool: derives the Anti-sniper Config from the Standard Config (same supply, curve,
+// graduation and recipients) and only swaps in Ammora's linear fee scheduler. Not linked in the menu.
+async function viewSetup(id) {
+  const base = PRESETS[0];
+  const p = SITE.antiSniper || { cliffFeeBps: 2000, reductionBps: 100, periods: 19, periodSeconds: 15 };
+  const endBps = p.cliffFeeBps - p.reductionBps * p.periods;
+  const existing = (SITE.launchPresets || []).find((x) => x.antiSniper && x.id !== null && x.id !== undefined);
+  app.innerHTML = `<div class="formcard card" style="max-width:620px">
+    <span class="chip">⚙ Owner setup</span>
+    <h2 style="margin-top:12px">Create the Anti-sniper Config</h2>
+    <div class="muted">Copies Config #${base.id} (supply, curve, graduation, fee recipients) and replaces its flat fee with Ammora's linear fee scheduler:
+      <b>${p.cliffFeeBps / 100}%</b> at launch, −${p.reductionBps / 100}% every ${p.periodSeconds}s, ending at <b>${endBps / 100}%</b> after ${Math.round(p.periods * p.periodSeconds / 60)} min.</div>
+    ${existing ? `<div class="alert ok" style="margin-top:12px">Already configured: Anti-sniper uses Config #${existing.id}.</div>` : ""}
+    <div id="smsg"></div>
+    <button class="btn grad block" id="screate" style="margin-top:14px">${W.address ? "Create Anti-sniper Config" : "Connect owner wallet"}</button>
+    <div class="note">Only the wallet that owns Config #${base.id} should run this. Creating a Config is permissionless and costs only gas.</div></div>`;
+  $("#screate").onclick = async () => {
+    try {
+      await ensureWallet();
+      const bn = await pc.getBlockNumber();
+      const src = await A.getAmmoraV4ConfigAtBlock(pc, L.configRegistry, base.id, bn);
+      if (src.identity.owner.toLowerCase() !== W.address.toLowerCase()) throw new Error(`Connect the owner wallet of Config #${base.id} (${short(src.identity.owner)}).`);
+      const config = { ...src.config, feeSchedulerMode: 1, cliffFeeBps: p.cliffFeeBps, feeReductionFactorBps: p.reductionBps,
+        feeNumberOfPeriods: p.periods, feePeriodFrequency: p.periodSeconds, enableFirstSwapWithMinFee: false };
+      A.assertAmmoraV4Config(config, src.segments);
+      $("#screate").disabled = true;
+      let created;
+      await stepModal("Creating Anti-sniper Config", [
+        { label: "Verify Ammora V4 contracts", run: async () => verifyCore(await pc.getBlockNumber()) },
+        { label: "Register Config on-chain", run: async () => {
+          const tx = A.buildCreateAmmoraV4Config(config, src.segments, W.address);
+          const receipt = await sendTx({ to: L.configRegistry, data: tx.data }, "Create Config");
+          created = A.parseAmmoraV4ConfigCreatedReceipt(receipt, L.configRegistry);
+        } },
+      ]).run();
+      $("#smsg").innerHTML = `<div class="alert ok" style="margin-top:12px"><b>Anti-sniper Config #${created.configId} created.</b><br>
+        In <span class="mono">src/config.js</span>, set the Anti-sniper preset to <span class="mono">id: ${created.configId}n</span>, then rebuild and redeploy.</div>`;
+    } catch (e) {
+      $("#smsg").innerHTML = `<div class="alert err" style="margin-top:12px">${esc(errText(e))}</div>`;
+      const b = $("#screate"); if (b) b.disabled = false;
+    }
+  };
+}
+
 /* ───────────────────────────── router ───────────────────────────── */
 async function render() {
   const id = ++renderId;
@@ -1525,6 +1695,7 @@ async function render() {
   if (route === "wallet") return viewWallet(id);
   if (route === "swap") return viewSwap(id, arg);
   if (route === "earnings") return viewEarnings(id);
+  if (route === "setup") return viewSetup(id);
   return viewExplore(id);
 }
 window.addEventListener("hashchange", render);
@@ -1532,4 +1703,6 @@ if (SITE.links?.x || SITE.links?.github) {
   $("#footlinks").innerHTML += [SITE.links.x && ` · <a href="${esc(SITE.links.x)}" target="_blank" rel="noopener">X</a>`, SITE.links.github && ` · <a href="${esc(SITE.links.github)}" target="_blank" rel="noopener">GitHub</a>`].filter(Boolean).join("");
 }
 render();
+// Warm the browser cache for the swap module once the first page is on screen.
+setTimeout(() => (window.requestIdleCallback || ((f) => setTimeout(f, 1)))(() => loadSwapModule().catch(() => {})), 2500);
 
