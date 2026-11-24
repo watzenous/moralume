@@ -39,6 +39,9 @@ const LAUNCH_EVENT = A.ammoraLaunchFactoryV4Abi.find((x) => x.type === "event" &
 const SWAP_EVENT = A.ammoraLaunchPoolV4Abi.find((x) => x.type === "event" && x.name === "Swap");
 const LAUNCH_TOPIC = toEventSelector(LAUNCH_EVENT);
 const SWAP_TOPIC = toEventSelector(SWAP_EVENT);
+// After graduation trading happens in the token's Ammora ARL (concentrated) pool.
+const POOL_SWAP_EVENTS = A.ammConcentratedPoolV3Abi.filter((x) => x.type === "event" && (x.name === "Swap" || x.name === "SwapPartialFill"));
+const POOL_SWAP_TOPICS = POOL_SWAP_EVENTS.map((e) => toEventSelector(e));
 const wethAbi = [
   { type: "function", name: "deposit", stateMutability: "payable", inputs: [], outputs: [] },
   { type: "function", name: "withdraw", stateMutability: "nonpayable", inputs: [{ type: "uint256", name: "wad" }], outputs: [] },
@@ -51,7 +54,7 @@ const PRESETS = ((SITE.launchPresets && SITE.launchPresets.length) ? SITE.launch
 const SITE_CONFIGS = new Set([siteConfigId(), ...PRESETS.map((p) => p.id)].map(String));
 const isSiteConfig = (cid) => cid !== undefined && cid !== null && SITE_CONFIGS.has(String(cid));
 const presetFor = (cid) => PRESETS.find((p) => String(p.id) === String(cid));
-const shieldBadge = (cid) => (presetFor(cid)?.antiSniper ? `<span class="badge b-shield" title="Anti-sniper launch: high fee at launch that decays to 1%">🛡 Anti-sniper</span>` : "");
+const shieldBadge = (cid) => (presetFor(cid)?.antiSniper ? `<span class="badge b-shield" title="Anti-sniper launch: high fee at launch that decays to 1%">Anti-sniper</span>` : "");
 // Moderation: tokens listed in SITE.hiddenTokens (token or curve address) are not shown anywhere on this site.
 const HIDDEN = new Set((SITE.hiddenTokens || []).map((a) => String(a).toLowerCase()));
 const isHidden = (...addrs) => addrs.some((a) => a && HIDDEN.has(String(a).toLowerCase()));
@@ -188,7 +191,7 @@ window.addEventListener("eip6963:announceProvider", (e) => {
 window.dispatchEvent(new Event("eip6963:requestProvider"));
 const savedWallet = () => { try { return localStorage.getItem(WALLET_KEY); } catch { return null; } };
 let current = null; // the provider in use
-const eth = () => current || WALLETS.find((w) => w.info.rdns === savedWallet())?.provider || window.ethereum;
+const eth = () => current || WALLETS.find((w) => w.info.rdns === savedWallet())?.provider || window.ethereum || WALLETS[0]?.provider;
 
 // "Disconnected" is remembered so the site does not silently re-attach the wallet on reload.
 const DISCONNECTED = "moralume.walletDisconnected";
@@ -214,8 +217,9 @@ function pickWallet() {
   return new Promise((resolve, reject) => {
     const bg = document.createElement("div");
     bg.className = "modal-bg";
-    const icon = (w) => /^data:image\/(png|jpe?g|gif|webp|svg\+xml)[;,]/i.test(w.info.icon || "")
-      ? `<img src="${esc(w.info.icon)}" alt="" />` : `<span>${esc((w.info.name || "?").slice(0, 1))}</span>`;
+    // Wallets announce their logo as a data: URI (most) or an https URL (some, e.g. Phantom).
+    const iconSrc = (w) => { const u = String(w.info.icon || "").trim(); return /^data:image\//i.test(u) || /^https:\/\//i.test(u) ? u : ""; };
+    const icon = (w) => iconSrc(w) ? `<img src="${esc(iconSrc(w))}" alt="" data-letter="${esc((w.info.name || "?").slice(0, 1))}" />` : `<span>${esc((w.info.name || "?").slice(0, 1))}</span>`;
     bg.innerHTML = `<div class="modal"><h3>Connect a wallet</h3>
       <div class="muted" style="margin-bottom:12px">Choose the wallet you want to use on ${esc(SITE.name)}.</div>
       <div class="wlist">${WALLETS.map((w, i) => `<button class="wopt" data-i="${i}">${icon(w)}<b>${esc(w.info.name || w.info.rdns)}</b>
@@ -228,6 +232,9 @@ function pickWallet() {
       else if (e.target === bg || e.target.closest("[data-x]")) { close(); reject(Object.assign(new Error("cancelled"), { cancelled: true })); }
     };
     document.body.appendChild(bg);
+    bg.querySelectorAll(".wopt img").forEach((im) => im.addEventListener("error", () => {
+      const sp = document.createElement("span"); sp.textContent = im.dataset.letter || "?"; im.replaceWith(sp);
+    }));
   });
 }
 
@@ -320,7 +327,7 @@ function renderHeader() {
   const f = $("#faucet");
   if (f) { const u = safeUrl(SITE.faucetUrl || ""); if (u) f.href = u; else f.remove(); }
   $("#brand").textContent = SITE.name;
-  document.title = `${SITE.name} — Token launchpad on GIWA, powered by Ammora`;
+  document.title = `${SITE.name} | Token Launchpad on GIWA, powered by Ammora`;
   const btn = $("#connect");
   btn.textContent = W.address ? `${short(W.address)} ▾` : "Connect wallet";
   btn.className = W.address ? "btn ghost" : "btn dark";
@@ -330,7 +337,7 @@ function renderHeader() {
   net.innerHTML = wrong ? `<i class="dot"></i><b>Wrong network</b><span>Switch</span>` : `<i class="dot"></i><b>GIWA</b><span>Testnet</span>`;
   net.title = wrong ? "Click to switch to GIWA Sepolia" : "GIWA Sepolia testnet";
   const route = (location.hash.replace(/^#\/?/, "").split("/")[0]) || "";
-  document.querySelectorAll(".links a").forEach((a) => a.classList.toggle("active", a.dataset.route === route));
+  document.querySelectorAll(".links a").forEach((a) => a.classList.toggle("active", a.dataset.route === (route === "earnings" ? "portfolio" : route)));
 }
 // Connected: the address button opens a small menu (copy, explorer, switch wallet, disconnect).
 function closeWalletMenu() { $("#wmenu")?.remove(); }
@@ -340,7 +347,7 @@ function openWalletMenu() {
   m.id = "wmenu";
   m.className = "wmenu";
   m.innerHTML = `<div class="wmenu-addr mono">${esc(W.address)}</div>
-    <button data-a="earnings">My earnings</button>
+    <button data-a="portfolio">Portfolio</button>
     <button data-a="copy">Copy address</button>
     <button data-a="explorer">View on explorer ↗</button>
     <button data-a="switch">Switch wallet</button>
@@ -351,7 +358,7 @@ function openWalletMenu() {
   m.style.right = `${Math.max(12, window.innerWidth - r.right)}px`;
   m.querySelectorAll("button").forEach((b) => (b.onclick = async () => {
     const act = b.dataset.a;
-    if (act === "earnings") { closeWalletMenu(); location.hash = "#/earnings"; }
+    if (act === "portfolio") { closeWalletMenu(); location.hash = "#/portfolio"; }
     if (act === "copy") { try { await navigator.clipboard.writeText(W.address); toast("Address copied."); } catch { toast("Could not copy.", "err"); } closeWalletMenu(); }
     if (act === "explorer") { window.open(addrUrl(W.address), "_blank", "noopener,noreferrer"); closeWalletMenu(); }
     if (act === "switch") { closeWalletMenu(); try { await connect(true); await ensureChain(); render(); } catch (e) { if (e.message !== "No wallet" && !e.cancelled) toast(esc(errText(e)), "err"); } }
@@ -516,8 +523,16 @@ async function fetchNewLaunchLogs() {
   return items.map((x) => ({ ...x, configId: BigInt(x.configId) }));
 }
 
-async function loadLaunches(force = false) {
-  if (!force && Date.now() - launchCache.at < 30_000 && launchCache.list.length) return launchCache.list;
+// Several parts of the page (ticker, explore, swap) may ask at once: share one request.
+let launchesInflight = null;
+function loadLaunches(force = false) {
+  if (!force && Date.now() - launchCache.at < 30_000 && launchCache.list.length) return Promise.resolve(launchCache.list);
+  if (launchesInflight && !force) return launchesInflight;
+  const p = loadLaunchesNow().finally(() => { if (launchesInflight === p) launchesInflight = null; });
+  launchesInflight = p;
+  return p;
+}
+async function loadLaunchesNow() {
   const byCurve = new Map();
   for (const x of await fetchNewLaunchLogs()) byCurve.set(x.curve, x);
   for (const x of localLaunches()) if (!byCurve.has(x.curve)) byCurve.set(x.curve, { ...x, configId: BigInt(x.configId) });
@@ -548,11 +563,56 @@ async function enrich(list) {
     x.mcap = x.supply ? x.price * Number(formatUnits(x.supply, x.decimals)) : 0;
     x.progress = x.status >= 2 ? 1 : x.threshold ? Math.min(1, Number(x.quoteReserve ?? 0n) / Number(x.threshold)) : 0;
   });
+  // Graduated tokens trade in their ARL pool: price and market cap come from the pool, not the frozen curve.
+  const grads = list.filter((x) => x.status === 3 && x.pool && x.pool !== zeroAddress);
+  if (grads.length) {
+    const res = [];
+    for (let i = 0; i < grads.length; i += 250) res.push(...await pc.multicall({ contracts: grads.slice(i, i + 250).map((x) => ({ address: x.pool, abi: A.ammConcentratedPoolV3Abi, functionName: "sqrtPrice" })), allowFailure: true }));
+    grads.forEach((x, i) => {
+      if (res[i]?.status !== "success") return;
+      x.price = sqrtToPrice(res[i].result, x.decimals);
+      x.mcap = x.supply ? x.price * Number(formatUnits(x.supply, x.decimals)) : 0;
+    });
+  }
   await Promise.all(list.map(async (x) => {
     if (x.metadataURI?.startsWith("data:")) x.meta = await readMetadata(x.metadataURI);
   }));
 }
 
+// ETH → USD for market caps. Testnet ETH has no value of its own, so values use the real ETH price
+// as a reference. Two public, key-less price endpoints (allowed in the CSP); falls back to ETH if both fail.
+const PRICE_KEY = "moralume.ethusd";
+let ethUsd = (() => { try { const c = JSON.parse(localStorage.getItem(PRICE_KEY) || "null"); return c && Date.now() - c.at < 6 * 3600e3 ? c.usd : 0; } catch { return 0; } })();
+async function fetchEthUsd() {
+  const tries = [
+    async () => Number((await (await fetch("https://api.coinbase.com/v2/prices/ETH-USD/spot")).json())?.data?.amount),
+    async () => Number((await (await fetch("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd")).json())?.ethereum?.usd),
+  ];
+  for (const t of tries) {
+    try { const v = await t(); if (v > 0 && v < 1e6) return v; } catch {}
+  }
+  return 0;
+}
+const usdCompact = (v) => {
+  if (!(v > 0)) return "$0";
+  if (v >= 1e9) return `$${(v / 1e9).toFixed(2)}B`;
+  if (v >= 1e6) return `$${(v / 1e6).toFixed(2)}M`;
+  if (v >= 1e3) return `$${(v / 1e3).toFixed(v >= 1e5 ? 0 : 1)}K`;
+  if (v >= 1) return `$${v.toFixed(2)}`;
+  return `$${v.toPrecision(2)}`;
+};
+// Market cap (or any ETH value) as dollars when the price is known, otherwise in ETH.
+const mc = (eth, digits) => ethUsd ? usdCompact((eth || 0) * ethUsd) : `${fmtNum(eth || 0, digits)} ETH`;
+async function refreshEthUsd() {
+  const had = ethUsd, v = await fetchEthUsd();
+  if (!v) return;
+  ethUsd = v;
+  try { localStorage.setItem(PRICE_KEY, JSON.stringify({ usd: v, at: Date.now() })); } catch {}
+  if (!had) { if (launchCache.list.length) renderTicker(launchCache.list); render(); } // first price: redraw values
+}
+
+// Progress text that never rounds up to 100% while a tiny amount is still missing.
+const pct = (p, d = 1) => { const f = 10 ** d; let v = Math.floor(Math.min(1, Math.max(0, p)) * 100 * f) / f; if (p < 1 && v >= 100) v = 100 - 1 / f; return v.toFixed(d); };
 const statusBadge = (s) => s === 1 ? `<span class="badge b-live">Live</span>`
   : s === 2 ? `<span class="badge b-ready">Graduating</span>`
   : s === 3 ? `<span class="badge b-grad">Graduated</span>` : `<span class="badge b-off">Inactive</span>`;
@@ -574,29 +634,63 @@ document.addEventListener("error", (e) => {
 }, true);
 
 /* ───────────────────────────── views: explore ───────────────────────────── */
-const ui = { tab: "site", q: "" };
+const ui = { tab: "site", q: "", board: "new" };
+// Explore view ("board": three columns like a trading board, "grid": cards) and quick-buy amount, remembered per visitor.
+const pref = (k, d) => { try { return localStorage.getItem("moralume." + k) ?? d; } catch { return d; } };
+const setPref = (k, v) => { try { localStorage.setItem("moralume." + k, v); } catch {} };
+ui.view = pref("view", "board");
+ui.quick = pref("quick", "0.01");
 let renderId = 0;
 
 async function viewExplore(id) {
   app.innerHTML = `
-  <section class="hero">
-    <span class="chip">🌙 Built with the Ammora SDK on GIWA</span>
-    <h1>Launch gently. Grow on a bonding curve. Graduate into real liquidity.</h1>
-    <p>${esc(SITE.tagline)} Every token gets an Ammora ALC bonding curve; when the curve fills, it migrates into a permanent ARL liquidity pool.</p>
-    <div style="display:flex;gap:10px;flex-wrap:wrap"><a class="btn grad" href="#/create">Launch a token</a><a class="btn ghost" href="#/swap">Swap tokens</a></div>
-    <div class="stats" id="stats">${[1, 2, 3, 4].map(() => `<div class="stat"><div class="k skel" style="height:12px;width:60%"></div><div class="v skel" style="height:24px;margin-top:8px"></div></div>`).join("")}</div>
-  </section>
   <div class="toolbar">
-    <div class="tabs" id="tabs">
-      ${[["site", "This launchpad"], ["all", "All Ammora"], ["live", "Live"], ["ready", "Graduating"], ["grad", "Graduated"], ["mine", "Mine"]]
-        .map(([k, t]) => `<button data-k="${k}" class="${ui.tab === k ? "on" : ""}">${t}</button>`).join("")}
-    </div>
+    <div class="tabs" id="tabs"></div>
     <input class="search" id="q" placeholder="Search name, symbol or address" value="${esc(ui.q)}" />
+    <label class="qbuy" title="Amount spent by the quick-buy buttons"><span>Quick buy</span><input id="qamt" inputmode="decimal" value="${esc(ui.quick)}"/><span>ETH</span></label>
+    <div class="viewsw" id="viewsw"><button data-v="board" class="${ui.view === "board" ? "on" : ""}" title="Board view">Board</button><button data-v="grid" class="${ui.view === "grid" ? "on" : ""}" title="Card view">Cards</button></div>
     <button class="btn ghost small" id="refresh">Refresh</button>
   </div>
   <div class="grid" id="grid">${Array.from({ length: 6 }, () => `<div class="card lcard"><div class="skel" style="height:48px"></div><div class="skel" style="height:34px"></div><div class="skel" style="height:8px"></div></div>`).join("")}</div>`;
 
   let list = [];
+  const TABS_GRID = [["site", "This launchpad"], ["all", "All Ammora"], ["live", "Live"], ["ready", "Graduating"], ["grad", "Graduated"], ["mine", "Mine"]];
+  const TABS_BOARD = [["site", "This launchpad"], ["all", "All Ammora"], ["mine", "Mine"]];
+  const drawTabs = () => {
+    const tabs = ui.view === "board" ? TABS_BOARD : TABS_GRID;
+    if (!tabs.some(([k]) => k === ui.tab)) ui.tab = "site";
+    $("#tabs").innerHTML = tabs.map(([k, t]) => `<button data-k="${k}" class="${ui.tab === k ? "on" : ""}">${t}</button>`).join("");
+    document.querySelectorAll("#tabs button").forEach((b) => (b.onclick = () => { ui.tab = b.dataset.k; drawTabs(); draw(); }));
+  };
+  // Board row: compact line with a quick-buy button.
+  const boardRow = (x) => {
+    const live = x.status === 1, ready = x.status === 2, grad = x.status === 3;
+    const action = ready ? `<a class="qbtn alt" href="#/token/${x.curve}">Migrate</a>`
+      : `<button class="qbtn" data-buy="${x.curve}" title="Buy ${esc(ui.quick)} ETH of $${esc(x.symbol || "")}">⚡ ${esc(ui.quick)}</button>`;
+    return `<a class="brow" href="#/token/${x.curve}">
+      ${avatar(x)}
+      <div class="bmain">
+        <div class="btop"><b class="bname">${esc(x.name || x.meta?.name || "Unnamed")}</b><span class="muted bsym">$${esc(x.symbol || x.meta?.symbol || "")}</span>${officialBadge(x)}${shieldBadge(x.configId)}</div>
+        <div class="bmeta"><span>${x.time ? timeAgo(x.time) : `block ${x.block}`}</span><span>·</span><span>MC <b>${mc(x.mcap)}</b></span>${!grad ? `<span>·</span><span>${pct(x.progress, 1)}%</span>` : ""}</div>
+        ${!grad ? `<div class="bar thin"><i style="width:${(x.progress * 100).toFixed(1)}%"></i></div>` : ""}
+      </div>
+      ${action}
+    </a>`;
+  };
+  const drawBoard = (rows) => {
+    const fresh = rows.filter((x) => x.status === 1 && x.progress < 0.5).sort((a, b) => (b.time || b.block || 0) - (a.time || a.block || 0));
+    const soon = rows.filter((x) => (x.status === 1 && x.progress >= 0.5) || x.status === 2).sort((a, b) => (b.status === 2) - (a.status === 2) || b.progress - a.progress);
+    const done = rows.filter((x) => x.status === 3).sort((a, b) => isOfficial(b) - isOfficial(a) || (b.mcap || 0) - (a.mcap || 0));
+    const col = (key, title, items, empty) => `<section class="bcol ${ui.board === key ? "on" : ""}" data-col="${key}">
+      <div class="bhead"><span class="bdot ${key}"></span><b>${title}</b><span class="muted">${items.length}</span></div>
+      <div class="blist">${items.length ? items.slice(0, 40).map(boardRow).join("") : `<div class="bempty">${empty}</div>`}</div></section>`;
+    $("#grid").className = "board";
+    $("#grid").innerHTML = `<div class="bswitch">${[["new", "New", fresh.length], ["soon", "About to graduate", soon.length], ["done", "Graduated", done.length]].map(([k, t, n]) => `<button data-b="${k}" class="${ui.board === k ? "on" : ""}">${t} <span>${n}</span></button>`).join("")}</div>
+      ${col("new", "Newly created", fresh, "No new tokens right now.")}
+      ${col("soon", "About to graduate", soon, "Nothing close to graduating yet.")}
+      ${col("done", "Graduated", done, "No graduated tokens yet.")}`;
+    document.querySelectorAll(".bswitch button").forEach((b) => (b.onclick = () => { ui.board = b.dataset.b; draw(); }));
+  };
   const draw = () => {
     if (id !== renderId) return;
     const q = ui.q.trim().toLowerCase();
@@ -608,6 +702,8 @@ async function viewExplore(id) {
     if (ui.tab === "mine") rows = W.address ? rows.filter((x) => x.creator === W.address) : [];
     if (q) rows = rows.filter((x) => [x.name, x.symbol, x.token, x.curve, x.meta?.name].some((s) => String(s || "").toLowerCase().includes(q)));
     const g = $("#grid");
+    if (ui.view === "board" && (rows.length || ui.tab !== "mine" || W.address)) { drawBoard(rows); return; }
+    g.className = "grid";
     if (!rows.length) {
       g.innerHTML = `<div class="empty">${ui.tab === "site" ? `No tokens on this launchpad yet. <a href="#/create">Launch the first one →</a>` : ui.tab === "mine" && !W.address ? "Connect your wallet to see your launches." : "Nothing here yet."}</div>`;
       return;
@@ -620,18 +716,55 @@ async function viewExplore(id) {
           <div style="display:grid;gap:4px;justify-items:end">${statusBadge(x.status)}${isSiteConfig(x.configId) ? `<span class="badge b-site">${esc(SITE.name)}</span>` : ""}${shieldBadge(x.configId)}</div>
         </div>
         <div class="ldesc">${esc(x.meta?.description || `Created by ${short(x.creator)} · Config #${x.configId}`)}</div>
-        <div class="row"><span class="muted">Market cap</span><b>${fmtNum(x.mcap)} ETH</b></div>
-        <div><div class="row" style="margin-bottom:6px"><span class="muted">Bonding curve</span><b>${(x.progress * 100).toFixed(1)}%</b></div><div class="bar"><i style="width:${(x.progress * 100).toFixed(1)}%"></i></div></div>
+        <div class="row"><span class="muted">Market cap</span><b>${mc(x.mcap)}</b></div>
+        <div><div class="row" style="margin-bottom:6px"><span class="muted">Bonding curve</span><b>${pct(x.progress, 1)}%</b></div><div class="bar"><i style="width:${(x.progress * 100).toFixed(1)}%"></i></div></div>
         <div class="row muted"><span>${x.time ? timeAgo(x.time) : `block ${x.block}`}</span><span>by ${short(x.creator)}</span></div>
       </a>`).join("");
   };
   const bind = () => {
-    document.querySelectorAll("#tabs button").forEach((b) => (b.onclick = () => { ui.tab = b.dataset.k; document.querySelectorAll("#tabs button").forEach((y) => y.classList.toggle("on", y === b)); draw(); }));
+    drawTabs();
     $("#q").oninput = (e) => { ui.q = e.target.value; draw(); };
+    $("#qamt").onchange = (e) => {
+      const v = e.target.value.trim();
+      try { if (parseUnits(v, 18) <= 0n) throw 0; ui.quick = v; setPref("quick", v); } catch { e.target.value = ui.quick; toast("Enter a valid ETH amount for quick buy.", "err"); }
+      draw();
+    };
+    document.querySelectorAll("#viewsw button").forEach((b) => (b.onclick = () => {
+      ui.view = b.dataset.v; setPref("view", ui.view);
+      document.querySelectorAll("#viewsw button").forEach((y) => y.classList.toggle("on", y === b));
+      $(".qbuy").hidden = ui.view !== "board";
+      drawTabs(); draw();
+    }));
+    $(".qbuy").hidden = ui.view !== "board";
+    // Quick buy: one click, then confirm in the wallet. Uses the same trade engine as the token page.
+    $("#grid").addEventListener("click", async (e) => {
+      const b = e.target.closest("[data-buy]");
+      if (!b) return;
+      e.preventDefault(); e.stopPropagation();
+      if (b.disabled) return;
+      const curve = b.dataset.buy, label = b.textContent;
+      let inModal = false;
+      b.disabled = true; b.textContent = "…";
+      try {
+        await ensureWallet();
+        const amt = parseUnits(ui.quick, 18);
+        const ctx = await loadTradeCtx(curve), eng = engineFor(ctx);
+        if (!eng) throw new Error("This token is not tradable right now.");
+        const q = await eng.quote("buy", amt, swapState.slip);
+        const steps = await eng.buildSteps("buy", amt, swapState.slip);
+        inModal = true; // from here on, errors are shown inside the step modal
+        await stepModal(`Quick buy ${ctx.tok.symbol}`, steps).run();
+        tradeCtxCache.delete(curve);
+        toast(`Bought ~${fmtUnits(q.amountOut, ctx.tok.decimals)} ${esc(ctx.tok.symbol)} ✓`, "ok");
+      } catch (err) {
+        if (!inModal && err?.message !== "No wallet" && !err?.cancelled) toast(esc(errText(err)), "err");
+      } finally { b.disabled = false; b.textContent = label; }
+    });
     $("#refresh").onclick = async () => { $("#refresh").disabled = true; try { list = await loadLaunches(true); stats(); draw(); } finally { $("#refresh").disabled = false; } };
   };
+  // Summary stats were removed from Explore (the page shows only tokens); kept for reuse elsewhere.
   const stats = () => {
-    if (id !== renderId) return;
+    if (id !== renderId || !$("#stats")) return;
     const visible = list.filter((x) => !isHidden(x.token, x.curve));
     const live = visible.filter((x) => x.status === 1).length;
     const grad = visible.filter((x) => x.status === 3).length;
@@ -645,7 +778,7 @@ async function viewExplore(id) {
     list = await loadLaunches();
     if (ui.tab === "site" && !list.some((x) => isSiteConfig(x.configId))) ui.tab = "all";
     if (id !== renderId) return;
-    document.querySelectorAll("#tabs button").forEach((y) => y.classList.toggle("on", y.dataset.k === ui.tab));
+    drawTabs();
     stats(); draw();
   } catch (e) {
     if (id === renderId) $("#grid").innerHTML = `<div class="empty">Could not load launches: ${esc(errText(e))}</div>`;
@@ -705,17 +838,36 @@ async function viewToken(id, curveParam) {
     app.innerHTML = `<div class="formcard card"><h2>Token unavailable</h2><div class="alert warn">This token has been hidden on ${esc(SITE.name)}.</div><a class="btn ghost" href="#/">← Back to explore</a></div>`;
     return;
   }
+  const pool = st.status === 3 && st.canonicalPool !== zeroAddress ? st.canonicalPool : null;
+  let poolSqrt = null;
   try {
     const logs = await explorerLogs({ address: curve, topic0: SWAP_TOPIC, fromBlock: info?.block ?? FACTORY_START });
     trades = logs.map((l) => {
       const ev = decodeEventLog({ abi: A.ammoraLaunchPoolV4Abi, data: l.data, topics: l.topics.filter(Boolean) });
-      return { ...ev.args, time: Number(l.timeStamp), tx: l.transactionHash, block: Number(l.blockNumber) };
+      return { ...ev.args, venue: "Curve", time: Number(l.timeStamp), tx: l.transactionHash, block: Number(l.blockNumber), logIndex: Number(l.logIndex || 0) };
     });
   } catch {}
+  if (pool) {
+    // Post-graduation trades: Swap / SwapPartialFill events of the ARL pool, in the same shape as curve trades.
+    try {
+      poolSqrt = await pc.readContract({ address: pool, abi: A.ammConcentratedPoolV3Abi, functionName: "sqrtPrice" });
+      const fromBlock = trades.length ? trades[trades.length - 1].block : (info?.block ?? FACTORY_START);
+      const sets = await Promise.all(POOL_SWAP_TOPICS.map((topic0) => explorerLogs({ address: pool, topic0, fromBlock }).catch(() => [])));
+      for (const l of sets.flat()) {
+        try {
+          const ev = decodeEventLog({ abi: POOL_SWAP_EVENTS, data: l.data, topics: l.topics.filter(Boolean) });
+          const a = ev.args;
+          trades.push({ venue: "Pool", baseForQuote: a.tokenIn.toLowerCase() !== WETH.toLowerCase(), amountIn: a.amountIn, amountOut: a.amountOut,
+            trader: a.recipient, nextSqrtPrice: a.sqrtPrice, time: Number(l.timeStamp), tx: l.transactionHash, block: Number(l.blockNumber), logIndex: Number(l.logIndex || 0) });
+        } catch {}
+      }
+      trades.sort((p, q) => p.block - q.block || p.logIndex - q.logIndex);
+    } catch {}
+  }
   if (id !== renderId) return;
 
   const dec = tok.decimals;
-  const price = sqrtToPrice(st.sqrtPrice, dec);
+  const price = sqrtToPrice(poolSqrt ?? st.sqrtPrice, dec);
   const mcap = price * Number(formatUnits(tok.supply, dec));
   const progress = st.status >= 2 ? 1 : Number(st.quoteReserve) / Number(st.migrationQuoteThreshold || 1n);
   const links = [["Website", meta.website], ["X", meta.twitter], ["Telegram", meta.telegram]].filter(([, u]) => safeUrl(u));
@@ -734,15 +886,18 @@ async function viewToken(id, curveParam) {
         ${links.length ? `<div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">${links.map(([t, u]) => `<a class="btn ghost small" href="${esc(safeUrl(u))}" target="_blank" rel="noopener noreferrer nofollow">${t} ↗</a>`).join("")}</div>` : ""}
         <div class="kv">
           <div><div class="k">Price</div><div class="v">${fmtNum(price)} ETH</div></div>
-          <div><div class="k">Market cap</div><div class="v">${fmtNum(mcap)} ETH</div></div>
-          <div><div class="k">Curve reserve</div><div class="v">${fmtUnits(st.quoteReserve, 18)} WETH</div></div>
+          <div><div class="k">Market cap</div><div class="v" title="${fmtNum(mcap)} ETH">${mc(mcap)}</div></div>
+          ${pool ? `<div><div class="k">Trading in</div><div class="v"><a href="${addrUrl(pool)}" target="_blank" rel="noopener">ARL pool ↗</a></div></div>`
+            : `<div><div class="k">Curve reserve</div><div class="v">${fmtUnits(st.quoteReserve, 18)} WETH</div></div>`}
           <div><div class="k">Trades</div><div class="v">${trades.length}</div></div>
         </div>
         <div style="margin-top:16px">
-          <div class="row" style="margin-bottom:6px"><span class="muted">Bonding curve progress — graduates at ${fmtUnits(st.migrationQuoteThreshold, 18)} WETH</span><b>${(Math.min(1, progress) * 100).toFixed(2)}%</b></div>
+          <div class="row" style="margin-bottom:6px"><span class="muted">Bonding curve progress — graduates at ${fmtUnits(st.migrationQuoteThreshold, 18)} WETH</span><b>${pct(progress, 2)}%</b></div>
           <div class="bar" style="height:12px"><i style="width:${(Math.min(1, progress) * 100).toFixed(2)}%"></i></div>
         </div>
-        ${presetFor(st.configId)?.antiSniper && st.status === 1 && st.currentFeeBps > 100 ? `<div class="alert warn" style="margin-top:12px">🛡 Anti-sniper launch: the trading fee is <b>${(st.currentFeeBps / 100).toFixed(0)}%</b> right now and drops 1% every 15 seconds until it reaches 1%. Refresh to see the current fee.</div>` : ""}
+        ${st.status === 1 && progress >= 0.99 && st.quoteReserve < st.migrationQuoteThreshold ? `<div class="alert info" style="margin-top:12px">Almost full: only <b>${fmtUnits(st.migrationQuoteThreshold - st.quoteReserve, 18)} WETH</b> is left. The next buy completes the curve, then anyone can migrate it to the ARL pool.</div>` : ""}
+        ${st.status === 2 ? `<div class="alert info" style="margin-top:12px">The curve is full. It becomes <b>Graduated</b> once someone sends the one-click <b>Migrate</b> transaction (gas only, anyone can do it).</div>` : ""}
+        ${presetFor(st.configId)?.antiSniper && st.status === 1 && st.currentFeeBps > 100 ? `<div class="alert warn" style="margin-top:12px">Anti-sniper launch: the trading fee is <b>${(st.currentFeeBps / 100).toFixed(0)}%</b> right now and drops 1% every 15 seconds until it reaches 1%. Refresh to see the current fee.</div>` : ""}
         <svg class="chart" id="chart" viewBox="0 0 700 220" preserveAspectRatio="none"></svg>
         <div class="addr">
           <div><span>Token</span> <a class="mono" href="${addrUrl(st.baseToken)}" target="_blank" rel="noopener">${short(st.baseToken)}</a></div>
@@ -753,11 +908,11 @@ async function viewToken(id, curveParam) {
         </div>
       </div>
       <div class="card panel" style="margin-top:14px">
-        <div class="sect" style="margin-top:0">Bonding-curve trades</div>
-        ${trades.length ? `<div style="overflow:auto"><table><thead><tr><th>Type</th><th>Paid</th><th>Received</th><th>Trader</th><th>When</th></tr></thead><tbody>
+        <div class="sect" style="margin-top:0">${pool ? "Trades" : "Bonding-curve trades"}</div>
+        ${trades.length ? `<div style="overflow:auto"><table><thead><tr><th>Type</th>${pool ? "<th>Venue</th>" : ""}<th>Paid</th><th>Received</th><th>Trader</th><th>When</th></tr></thead><tbody>
           ${trades.slice(-40).reverse().map((t) => {
             const sell = t.baseForQuote;
-            return `<tr><td><b class="${sell ? "bad" : "good"}">${sell ? "Sell" : "Buy"}</b></td>
+            return `<tr><td><b class="${sell ? "bad" : "good"}">${sell ? "Sell" : "Buy"}</b></td>${pool ? `<td><span class="badge ${t.venue === "Pool" ? "b-grad" : "b-off"}">${t.venue}</span></td>` : ""}
               <td>${sell ? fmtUnits(t.amountIn, dec) + " " + esc(tok.symbol) : fmtUnits(t.amountIn, 18) + " WETH"}</td>
               <td>${sell ? fmtUnits(t.amountOut, 18) + " WETH" : fmtUnits(t.amountOut, dec) + " " + esc(tok.symbol)}</td>
               <td><a class="mono" href="${addrUrl(t.trader)}" target="_blank" rel="noopener">${short(t.trader)}</a></td>
@@ -1032,22 +1187,43 @@ const assetFromLaunch = (x) => ({ kind: "token", curve: x.curve, token: x.token,
 const assetLabel = (a) => a ? (a.kind === "eth" ? `<div class="avatar sm eth">Ξ</div><b>ETH</b>` : `${avatar(a, "sm")}<b>${esc(a.symbol)}</b>`) : `<b>Select token</b>`;
 
 async function viewSwap(id, preselect) {
+  const slipOpts = [50, 100, 300, 500, 1000];
   app.innerHTML = `
-  <div class="formcard card swapcard">
-    <span class="chip">⇄ Exchange</span>
-    <h2 style="margin-top:12px">Swap</h2>
-    <div class="muted">Swap ETH and any Ammora launch on GIWA. Each trade routes through the token's bonding curve or, after graduation, its Ammora ARL pool.</div>
-    <div class="field" style="margin-top:18px"><div class="top"><span>You pay</span><span id="sbalFrom"></span></div>
-      <div class="mid"><input id="samt" inputmode="decimal" placeholder="0.0" autocomplete="off"/><button class="assetbtn" id="pickFrom"></button></div></div>
-    <div style="display:flex;justify-content:center;margin:-6px 0"><button class="flip" id="flip" title="Switch direction">⇅</button></div>
-    <div class="field"><div class="top"><span>You receive (est.)</span><span id="sbalTo"></span></div>
-      <div class="mid"><input id="sout" placeholder="0.0" readonly tabindex="-1"/><button class="assetbtn" id="pickTo"></button></div></div>
+  <div class="swpage">
+    <div class="swhero"><h2>Swap</h2>
+      <div class="muted">Trade any token launched on Ammora. We pick the right route for you: the bonding curve, or its pool after graduation.</div></div>
+    <div class="swgrid"><div class="swmain">
+    <div class="swpanel">
+      <div class="swtop"><span>You pay</span>
+        <div class="swslip"><button type="button" class="slipchip" id="slipbtn">Slippage <b id="slipval">${swapState.slip / 100}%</b></button>
+          <div class="slipmenu" id="slipmenu" hidden>${slipOpts.map((b) => `<button type="button" data-b="${b}">${b / 100}%</button>`).join("")}</div></div></div>
+      <div class="swmid"><input id="samt" inputmode="decimal" placeholder="0" autocomplete="off"/><button class="assetbtn" id="pickFrom"></button></div>
+      <div class="swbot"><span id="sbalFrom"></span><button type="button" class="maxbtn" id="smax" hidden>Max</button></div>
+    </div>
+    <div class="swflip"><button class="flip" id="flip" title="Switch direction">⇅</button></div>
+    <div class="swpanel">
+      <div class="swtop"><span>You receive</span></div>
+      <div class="swmid"><input id="sout" placeholder="0" readonly tabindex="-1"/><button class="assetbtn" id="pickTo"></button></div>
+      <div class="swbot"><span id="sbalTo"></span></div>
+    </div>
     <div class="quote" id="squote" style="display:none"></div>
     <div id="snote"></div>
-    <button class="btn grad block" id="sgo" style="margin-top:12px"></button>
-    <div class="row note"><span>Slippage (per leg)</span><select id="sslip" class="inp" style="padding:4px 8px;width:auto">${[50, 100, 300, 500, 1000].map((b) => `<option value="${b}" ${b === swapState.slip ? "selected" : ""}>${b / 100}%</option>`).join("")}</select></div>
-    <div class="note">ETH is wrapped to WETH automatically when needed; token → ETH swaps pay out WETH (unwrap it on the ETH ⇄ WETH page). Token → token swaps run as two trades through WETH.</div>
-  </div>`;
+    <button class="btn grad block swgo" id="sgo"></button>
+    <div class="swfoot"><span>ETH is wrapped automatically</span><span>·</span><span>Sells pay out WETH</span></div>
+    </div>
+    <aside class="card swpop"><div class="swpop-h"><b>Popular right now</b><span class="muted">on ${esc(SITE.name)}</span></div><div id="swpop"><div class="skel" style="height:120px"></div></div></aside>
+  </div></div>`;
+  // Slippage chip with a small menu.
+  $("#slipbtn").onclick = (e) => { e.stopPropagation(); $("#slipmenu").hidden = !$("#slipmenu").hidden; };
+  document.querySelectorAll("#slipmenu button").forEach((b) => (b.onclick = () => {
+    swapState.slip = Number(b.dataset.b); $("#slipval").textContent = `${swapState.slip / 100}%`; $("#slipmenu").hidden = true; requote();
+  }));
+  document.addEventListener("click", (e) => { const m = $("#slipmenu"); if (m && !e.target.closest(".swslip")) m.hidden = true; });
+  // Show the controls right away; token data fills in once launches are loaded.
+  $("#pickFrom").innerHTML = assetLabel(swapState.from) + " ▾";
+  $("#pickTo").innerHTML = assetLabel(swapState.to) + " ▾";
+  $("#pickTo").classList.toggle("empty", !swapState.to);
+  $("#sgo").textContent = W.address ? "Loading…" : "Connect wallet";
 
   let list = [];
   try { list = await loadLaunches(); } catch {}
@@ -1070,15 +1246,17 @@ async function viewSwap(id, preselect) {
       if (!a) return "";
       if (a.kind === "eth") {
         const [e, w] = await Promise.all([pc.getBalance({ address: W.address }), balanceOf(WETH, W.address)]);
-        return `${Number(formatUnits(e, 18)).toFixed(5)} ETH · ${Number(formatUnits(w, 18)).toFixed(5)} WETH`;
+        return `Balance: ${Number(formatUnits(e, 18)).toFixed(5)} ETH${w > 0n ? ` + ${Number(formatUnits(w, 18)).toFixed(5)} WETH` : ""}`;
       }
       return `Balance: ${fmtUnits(await balanceOf(a.token, W.address), a.decimals)}`;
     };
     try { $("#sbalFrom").innerHTML = await bal(swapState.from); $("#sbalTo").innerHTML = await bal(swapState.to); } catch {}
+    $("#smax").hidden = swapState.from.kind !== "token";
   };
   const draw = () => {
     $("#pickFrom").innerHTML = assetLabel(swapState.from) + " ▾";
     $("#pickTo").innerHTML = assetLabel(swapState.to) + " ▾";
+    $("#pickTo").classList.toggle("empty", !swapState.to);
     const g = $("#sgo");
     g.textContent = !W.address ? "Connect wallet" : !swapState.to ? "Select a token" : "Swap";
     showBalances();
@@ -1182,7 +1360,25 @@ async function viewSwap(id, preselect) {
     draw();
   };
   $("#samt").oninput = requote;
-  $("#sslip").onchange = (e) => { swapState.slip = Number(e.target.value); requote(); };
+  $("#smax").onclick = async () => {
+    if (!W.address || swapState.from.kind !== "token") return;
+    $("#samt").value = formatUnits(await balanceOf(swapState.from.token, W.address), swapState.from.decimals);
+    requote();
+  };
+  // Popular tokens: tap one to buy it.
+  // Tokens launched on this launchpad first (Ammora's own test launches have meaningless market caps).
+  const ours = tradable.filter((x) => isSiteConfig(x.configId));
+  const pop = (ours.length ? ours : tradable).slice().sort((a, b) => isOfficial(b) - isOfficial(a) || (b.mcap || 0) - (a.mcap || 0)).slice(0, 5);
+  $("#swpop").innerHTML = pop.length ? pop.map((x, i) => `<button class="poprow" data-c="${x.curve}"><span class="poprank">${i + 1}</span>${avatar(x, "sm")}
+      <span class="popname"><b>$${esc(x.symbol || "?")}</b>${officialBadge(x)}<br><span class="muted">${esc(x.name || "Unnamed")}</span></span>
+      <span class="popcap"><b>${mc(x.mcap, 4)}</b><br><span class="muted">mcap</span></span></button>`).join("")
+    : `<div class="muted" style="padding:12px 0">No tradable tokens yet.</div>`;
+  document.querySelectorAll("#swpop .poprow").forEach((b) => (b.onclick = () => {
+    const x = tradable.find((y) => y.curve === b.dataset.c);
+    if (!x) return;
+    swapState.from = ETH_ASSET; swapState.to = assetFromLaunch(x);
+    $("#samt").value = ""; draw(); window.scrollTo({ top: 0, behavior: "smooth" });
+  }));
   $("#sgo").onclick = async () => {
     try {
       await ensureWallet();
@@ -1252,40 +1448,22 @@ function freshCurveBuyQuote(config, segments, amountIn) {
   return { amountOut: out, fee, unfilled: rem };
 }
 
-/* ───────────────────────────── views: earnings ───────────────────────────── */
+/* ───────────────────────────── earnings (part of Portfolio) ───────────────────────────── */
 // Creator / partner launch fees (Ammora FeeVault) and graduated LP-position fees (ARL position NFTs).
 const TRANSFER_TOPIC = toEventSelector("Transfer(address,address,uint256)");
 let arlOptions = null;
 const dammOptions = () => (arlOptions ??= { deploymentSource: A.createAmmoraDeploymentSource([D]), factoryProfiles: A.giwaSepoliaAutoRoutePoolProfiles });
 
-async function viewEarnings(id) {
-  if (!W.address) {
-    app.innerHTML = `<div class="formcard card" style="max-width:560px"><span class="chip">💰 Earnings</span><h2 style="margin-top:12px">Your earnings</h2>
-      <div class="muted">Connect your wallet to see and claim the fees you earned as a token creator, as a launchpad partner, or from graduated liquidity positions.</div>
-      <button class="btn grad block" id="econnect" style="margin-top:16px">Connect wallet</button></div>`;
-    $("#econnect").onclick = async () => { try { await connect(); await ensureChain(); render(); } catch (e) { if (e.message !== "No wallet" && !e.cancelled) toast(esc(errText(e)), "err"); } };
-    return;
-  }
-  const me = W.address;
-  app.innerHTML = `
-  <div class="formcard card" style="max-width:820px">
-    <span class="chip">💰 Earnings</span>
-    <h2 style="margin-top:12px">Your earnings</h2>
-    <div class="muted">Fees earned by <span class="mono">${short(me)}</span> across every Ammora launch on GIWA: as a token creator, as a launchpad partner, and from liquidity positions created at graduation.</div>
-    <div class="sect">Launch trading fees</div>
-    <div id="evault"><div class="skel" style="height:60px"></div></div>
-    <div class="sect">Graduated liquidity positions</div>
-    <div id="elp"><div class="skel" style="height:60px"></div></div>
-    <div class="sect">Your launches</div>
-    <div id="emine"><div class="skel" style="height:40px"></div></div>
-  </div>`;
-
+// Fee loaders shared by the Portfolio page: FeeVault, LP positions and the wallet's own launches.
+// `report(key, value)` lets the page fill its summary tiles as each part arrives.
+function earningsLoaders(id, me, report = () => {}) {
   // 1) FeeVault: creator + partner shares of bonding-curve trading fees, paid in WETH.
   const loadVault = async () => {
     try {
       const vault = await pc.readContract({ address: L.factory, abi: A.ammoraLaunchFactoryV4Abi, functionName: "feeVault" });
       const owed = await pc.readContract({ address: vault, abi: A.feeVaultAbi, functionName: "claimable", args: [WETH, me] });
       if (id !== renderId) return;
+      report("vault", owed);
       $("#evault").innerHTML = `<div class="earnrow"><div><div class="muted" style="font-size:12px">Claimable in the Ammora fee vault</div>
         <div style="font-size:24px;font-weight:800">${fmtUnits(owed, 18, 6)} WETH</div>
         <div class="muted" style="font-size:12px">Creator and partner shares from bonding-curve trades. The vault adds up all your launches.</div></div>
@@ -1309,10 +1487,10 @@ async function viewEarnings(id) {
       const logs = await explorerLogs({ address: PM, topic0: TRANSFER_TOPIC, topic2: "0x" + me.slice(2).toLowerCase().padStart(64, "0") });
       const ids = [...new Set(logs.map((l) => BigInt(l.topics[3])))].slice(-60);
       const launches = await loadLaunches().catch(() => []);
-      const rows = [];
-      for (const tokenId of ids) {
+      // Read all positions in parallel (each needs owner, position and a fee simulation).
+      const rows = (await Promise.all(ids.map(async (tokenId) => {
         const owner = await pc.readContract({ address: PM, abi: A.ammConcentratedPositionManagerV3Abi, functionName: "ownerOf", args: [tokenId] }).catch(() => null);
-        if (!owner || owner.toLowerCase() !== me.toLowerCase()) continue;
+        if (!owner || owner.toLowerCase() !== me.toLowerCase()) return null;
         const pos = await pc.readContract({ address: PM, abi: A.ammConcentratedPositionManagerV3Abi, functionName: "getPosition", args: [tokenId] });
         let base = 0n, quote = 0n;
         try {
@@ -1320,9 +1498,10 @@ async function viewEarnings(id) {
           [base, quote] = result;
         } catch {}
         const launch = launches.find((x) => x.pool && x.pool.toLowerCase() === pos.pool.toLowerCase());
-        rows.push({ tokenId, pool: pos.pool, base, quote, launch, locked: pos.permanentLockedLiquidity > 0n });
-      }
+        return { tokenId, pool: pos.pool, base, quote, launch, locked: pos.permanentLockedLiquidity > 0n };
+      }))).filter(Boolean);
       if (id !== renderId) return;
+      report("lp", rows.reduce((s, r) => s + r.quote, 0n));
       if (!rows.length) { $("#elp").innerHTML = `<div class="muted">No liquidity positions yet. When a token you created (or partnered) graduates, its LP position appears here and keeps earning pool fees.</div>`; return; }
       $("#elp").innerHTML = `<div style="overflow:auto"><table><thead><tr><th>Position</th><th>Token</th><th>Claimable</th><th></th></tr></thead><tbody>
         ${rows.map((r, i) => {
@@ -1355,14 +1534,158 @@ async function viewEarnings(id) {
     try {
       const list = (await loadLaunches()).filter((x) => x.creator.toLowerCase() === me.toLowerCase() && !isHidden(x.token, x.curve));
       if (id !== renderId) return;
+      report("launched", list.length);
       $("#emine").innerHTML = list.length ? `<div class="grid" style="margin:0">${list.slice(0, 30).map((x) => `
         <a class="card lcard" href="#/token/${x.curve}"><div class="lhead">${avatar(x)}<div style="min-width:0;flex:1"><div class="lname">${esc(x.name || "Unnamed")}</div><div class="lsym">$${esc(x.symbol || "")}</div></div>${statusBadge(x.status)}</div>
-        <div><div class="row" style="margin-bottom:6px"><span class="muted">Bonding curve</span><b>${(x.progress * 100).toFixed(1)}%</b></div><div class="bar"><i style="width:${(x.progress * 100).toFixed(1)}%"></i></div></div></a>`).join("")}</div>`
+        <div><div class="row" style="margin-bottom:6px"><span class="muted">Bonding curve</span><b>${pct(x.progress, 1)}%</b></div><div class="bar"><i style="width:${(x.progress * 100).toFixed(1)}%"></i></div></div></a>`).join("")}</div>`
         : `<div class="muted">You have not launched a token yet. <a href="#/create">Launch one →</a></div>`;
     } catch { if (id === renderId) $("#emine").innerHTML = `<div class="muted">Could not load your launches.</div>`; }
   };
 
+  return { loadVault, loadLp, loadMine };
+}
+
+/* ───────────────────────────── views: portfolio ───────────────────────────── */
+// Everything about one wallet: what it holds, what it can claim, what it launched and its trades.
+async function viewPortfolio(id) {
+  const head = `<div class="phero"><div><span class="chip">Portfolio</span>
+    <h2>Your portfolio</h2>
+    <div class="muted">What you hold, the fees you can claim, the tokens you launched and every trade you made on Ammora launches.</div></div>
+    <a class="btn ghost" href="#/create">Launch a token</a></div>`;
+  if (!W.address) {
+    app.innerHTML = `<div class="pwrap">${head}
+      <div class="card empty-card"><b>Connect a wallet to see your portfolio</b>
+      <div class="muted">Holdings, claimable fees, your launches and your trades, all read straight from GIWA.</div>
+      <button class="btn grad" id="pconnect" style="margin-top:6px">Connect wallet</button></div></div>`;
+    $("#pconnect").onclick = async () => { try { await connect(); await ensureChain(); render(); } catch (e) { if (e.message !== "No wallet" && !e.cancelled) toast(esc(errText(e)), "err"); } };
+    return;
+  }
+  const me = W.address;
+  const tile = (key, label, sub) => `<div class="stat"><div class="k">${label}</div><div class="v" id="pt-${key}"><span class="skel" style="display:block;height:24px;margin-top:6px"></span></div><div class="psub" id="ps-${key}">${sub}</div></div>`;
+  app.innerHTML = `<div class="pwrap">${head}
+    <div class="stats">
+      ${tile("hold", "Holdings", "value of the tokens you hold")}
+      ${tile("fees", "Fees to claim", "launch fees + LP positions")}
+      ${tile("launched", "Launched", "tokens you created")}
+      ${tile("trades", "Trades", "buys and sells")}
+    </div>
+    <div class="card psec"><div class="psec-h"><h3>Holdings</h3><span class="muted" id="pwallet"></span></div><div id="phold"><div class="skel" style="height:80px"></div></div></div>
+    <div class="card psec"><div class="psec-h"><h3>Earnings</h3><span class="muted">Fees you earn as a token creator, as a launchpad partner and from graduated liquidity</span></div>
+      <div class="sect" style="margin-top:6px">Launch trading fees</div><div id="evault"><div class="skel" style="height:60px"></div></div>
+      <div class="sect">Graduated liquidity positions</div><div id="elp"><div class="skel" style="height:60px"></div></div></div>
+    <div class="card psec"><div class="psec-h"><h3>Your launches</h3></div><div id="emine"><div class="skel" style="height:40px"></div></div></div>
+    <div class="card psec"><div class="psec-h"><h3>Trades</h3><span class="muted">Your buys and sells on Ammora launches, newest first</span></div><div id="ptrades"><div class="skel" style="height:80px"></div></div></div>
+  </div>`;
+
+  // Summary tiles fill in as each part finishes.
+  const fees = { vault: null, lp: null };
+  const report = (k, v) => {
+    if (k === "launched") { $("#pt-launched") && ($("#pt-launched").textContent = String(v)); return; }
+    fees[k] = v;
+    if (fees.vault !== null && fees.lp !== null && $("#pt-fees")) {
+      const t = fees.vault + fees.lp;
+      $("#pt-fees").innerHTML = `${fmtUnits(t, 18, 6)} <small>WETH</small>`;
+    }
+  };
+  const { loadVault, loadLp, loadMine } = earningsLoaders(id, me, report);
   loadVault(); loadMine(); loadLp();
+
+  // Holdings: balances of every Ammora launch token + ETH/WETH, valued at the current price
+  // (bonding-curve price while live, ARL pool price after graduation).
+  const launches = await loadLaunches().catch(() => []);
+  const loadHoldings = async () => {
+    try {
+      const list = launches.filter((x) => x.token && x.status !== undefined);
+      const calls = list.map((x) => ({ address: x.token, abi: erc20Abi, functionName: "balanceOf", args: [me] }));
+      const res = [];
+      for (let i = 0; i < calls.length; i += 250) res.push(...await pc.multicall({ contracts: calls.slice(i, i + 250), allowFailure: true }));
+      const [ethBal, wethBal] = await Promise.all([pc.getBalance({ address: me }), pc.readContract({ address: WETH, abi: erc20Abi, functionName: "balanceOf", args: [me] })]);
+      const held = list.map((x, i) => ({ x, bal: res[i]?.status === "success" ? res[i].result : 0n })).filter((h) => h.bal > 0n);
+      // Graduated tokens trade in their ARL pool: read the pool price.
+      const grads = held.filter((h) => h.x.status === 3 && h.x.pool);
+      if (grads.length) {
+        const pr = await pc.multicall({ contracts: grads.map((h) => ({ address: h.x.pool, abi: A.ammConcentratedPoolV3Abi, functionName: "sqrtPrice" })), allowFailure: true });
+        grads.forEach((h, i) => { if (pr[i]?.status === "success") h.poolPrice = sqrtToPrice(pr[i].result, h.x.decimals); });
+      }
+      held.forEach((h) => { h.price = h.poolPrice ?? h.x.price ?? 0; h.amount = Number(formatUnits(h.bal, h.x.decimals)); h.value = h.amount * h.price; });
+      held.sort((a, b) => b.value - a.value);
+      if (id !== renderId) return;
+      const total = held.reduce((s, h) => s + h.value, 0);
+      $("#pt-hold").innerHTML = `${fmtNum(total, 6)} <small>ETH</small>`;
+      $("#ps-hold").textContent = `${held.length} token${held.length === 1 ? "" : "s"} you hold`;
+      $("#pwallet").innerHTML = `Wallet: <b>${fmtUnits(ethBal, 18, 5)}</b> ETH · <b>${fmtUnits(wethBal, 18, 5)}</b> WETH`;
+      $("#phold").innerHTML = held.length ? `<div style="overflow:auto"><table class="ptable"><thead><tr><th>Token</th><th>Balance</th><th>Price</th><th>Value</th><th>Status</th><th></th></tr></thead><tbody>
+        ${held.map((h) => `<tr>
+          <td><a class="ptok" href="#/token/${h.x.curve}">${avatar(h.x, "sm")}<span><b>${esc(h.x.name || "Unnamed")}</b>${officialBadge(h.x)}<br><span class="muted">$${esc(h.x.symbol || "")}</span></span></a></td>
+          <td>${fmtNum(h.amount)}</td>
+          <td>${h.price ? (h.price < 0.001 ? fmtTiny(h.price) : fmtNum(h.price, 6)) + " ETH" : "—"}</td>
+          <td><b>${fmtNum(h.value, 6)} ETH</b></td>
+          <td>${statusBadge(h.x.status)}</td>
+          <td style="text-align:right">${h.x.status === 1 || h.x.status === 3 ? `<a class="btn small ghost" href="#/token/${h.x.curve}">Trade</a>` : ""}</td></tr>`).join("")}
+        </tbody></table></div>` : `<div class="muted">You don't hold any Ammora launch tokens yet. <a href="#/">Explore launches →</a></div>`;
+    } catch (e) {
+      if (id === renderId) { $("#phold").innerHTML = `<div class="alert err">Could not load holdings: ${esc(errText(e))}</div>`; $("#pt-hold").textContent = "—"; }
+    }
+  };
+
+  // Trades: the explorer's ERC-20 transfer history for this wallet, grouped per transaction.
+  const loadTrades = async () => {
+    try {
+      const byToken = new Map(launches.map((x) => [x.token?.toLowerCase(), x]));
+      const q = new URLSearchParams({ module: "account", action: "tokentx", address: me, sort: "desc", page: "1", offset: "1000" });
+      const c = new AbortController(); const t = setTimeout(() => c.abort(), 30000);
+      const j = await fetch(`${EXPLORER}/api?${q}`, { signal: c.signal }).then((r) => r.json()).finally(() => clearTimeout(t));
+      const txs = Array.isArray(j.result) ? j.result : [];
+      const mine = me.toLowerCase(), weth = WETH.toLowerCase(), zero = "0x0000000000000000000000000000000000000000";
+      const groups = new Map();
+      for (const x of txs) {
+        if (!groups.has(x.hash)) groups.set(x.hash, { hash: x.hash, time: Number(x.timeStamp), parts: [] });
+        groups.get(x.hash).parts.push(x);
+      }
+      const rows = [];
+      for (const g of groups.values()) {
+        let wethIn = 0n, wethOut = 0n;
+        for (const p of g.parts) if (p.contractAddress.toLowerCase() === weth && p.from !== zero && p.to !== zero) {
+          if (p.to.toLowerCase() === mine) wethIn += BigInt(p.value); if (p.from.toLowerCase() === mine) wethOut += BigInt(p.value);
+        }
+        const toks = new Map();
+        for (const p of g.parts) {
+          const l = byToken.get(p.contractAddress.toLowerCase());
+          if (!l) continue;
+          const d = toks.get(l.token) || { l, net: 0n };
+          if (p.to.toLowerCase() === mine) d.net += BigInt(p.value);
+          if (p.from.toLowerCase() === mine) d.net -= BigInt(p.value);
+          toks.set(l.token, d);
+        }
+        for (const { l, net } of toks.values()) {
+          if (net === 0n) continue;
+          let side;
+          if (net > 0n && wethOut > 0n) side = "Buy";
+          else if (net < 0n && wethIn > 0n) side = "Sell";
+          else if (net > 0n && wethIn > 0n) side = "Claim";
+          else side = net > 0n ? "Received" : "Sent";
+          rows.push({ l, side, amount: net < 0n ? -net : net, weth: side === "Buy" ? wethOut : side === "Sell" || side === "Claim" ? wethIn : 0n, hash: g.hash, time: g.time });
+        }
+      }
+      if (id !== renderId) return;
+      const trades = rows.filter((r) => r.side === "Buy" || r.side === "Sell").length;
+      $("#pt-trades").textContent = String(trades);
+      $("#ps-trades").textContent = `${rows.filter((r) => r.side === "Buy").length} buys · ${rows.filter((r) => r.side === "Sell").length} sells`;
+      const sideBadge = (s) => `<span class="badge ${s === "Buy" ? "b-live" : s === "Sell" ? "b-sell" : "b-off"}">${s}</span>`;
+      $("#ptrades").innerHTML = rows.length ? `<div style="overflow:auto"><table class="ptable"><thead><tr><th>Token</th><th>Side</th><th>Tokens</th><th>Paid or received</th><th>When</th><th></th></tr></thead><tbody>
+        ${rows.slice(0, 200).map((r) => `<tr>
+          <td><a class="ptok" href="#/token/${r.l.curve}">${avatar(r.l, "sm")}<span><b>$${esc(r.l.symbol || "?")}</b></span></a></td>
+          <td>${sideBadge(r.side)}</td>
+          <td>${fmtUnits(r.amount, r.l.decimals ?? 9)}</td>
+          <td>${r.weth > 0n ? `${r.side === "Buy" ? "−" : "+"}${fmtUnits(r.weth, 18, 6)} WETH` : "—"}</td>
+          <td class="muted">${timeAgo(r.time)}</td>
+          <td style="text-align:right"><a class="mono" href="${txUrl(r.hash)}" target="_blank" rel="noopener">${r.hash.slice(0, 8)}… ↗</a></td></tr>`).join("")}
+        </tbody></table></div>` : `<div class="muted">No trades yet. Your buys and sells on Ammora launches will show up here.</div>`;
+    } catch (e) {
+      if (id === renderId) { $("#ptrades").innerHTML = `<div class="alert err">Could not load trades: ${esc(errText(e))}</div>`; $("#pt-trades").textContent = "—"; }
+    }
+  };
+  loadHoldings(); loadTrades();
 }
 
 /* ───────────────────────────── views: create ───────────────────────────── */
@@ -1372,73 +1695,157 @@ const verifyCore = async (bn) => (coreVerified ??= A.verifyAmmoraV4CoreAtBlock(p
 async function viewCreate(id) {
   let cfgId = PRESETS[0]?.id ?? siteConfigId();
   app.innerHTML = `
-  <div class="formcard card">
-    <span class="chip">🚀 New launch</span>
-    <h2 style="margin-top:12px">Launch a token</h2>
-    <div class="muted">Creates a new ERC-20 and its Ammora bonding curve in one transaction, on ${esc(SITE.name)}'s Ammora launch Config.</div>
-    ${PRESETS.length > 1 ? `<label class="l" style="margin-top:16px">Launch type</label>
-    <div class="presets" id="presets">${PRESETS.map((p, i) => `<button type="button" class="preset ${i === 0 ? "on" : ""}" data-i="${i}">
-      <b>${p.antiSniper ? "🛡 " : ""}${esc(p.name)}</b><span>${esc(p.description || "")}</span></button>`).join("")}</div>` : ""}
-    <div id="cfginfo" class="preview"><div class="skel" style="height:18px"></div><div class="skel" style="height:18px"></div></div>
-    <div class="fgrid">
-      <div><label class="l">Name</label><input class="inp" id="name" maxlength="40" placeholder="Moon Cat"/></div>
-      <div><label class="l">Ticker</label><input class="inp" id="sym" maxlength="12" placeholder="MCAT"/></div>
-      <div class="full"><label class="l">Description</label><textarea class="inp" id="desc" maxlength="280" placeholder="What is this token about? (short — it is stored on-chain)"></textarea></div>
-      <div class="full"><label class="l">Image</label>
-        <div class="imgpick"><div id="imgprev" class="avatar lg">?</div>
-          <div style="flex:1;display:grid;gap:8px"><input type="file" id="file" accept="image/png,image/jpeg,image/webp,image/gif" class="inp"/></div></div>
-        <div class="help" id="metahelp">The image is compressed to fit, together with the text, into Ammora's 2 KB on-chain metadata limit.</div></div>
-      <div><label class="l">Website (optional)</label><input class="inp" id="web" placeholder="https://"/></div>
-      <div><label class="l">X / Twitter (optional)</label><input class="inp" id="tw" placeholder="https://x.com/…"/></div>
-      <div><label class="l">Telegram (optional)</label><input class="inp" id="tg" placeholder="https://t.me/…"/></div>
-      <div><label class="l">Initial buy in ETH (optional)</label><input class="inp" id="first" inputmode="decimal" placeholder="0.001"/><div class="help" id="firsthelp">Bought in the same transaction as the launch, so nobody can buy before you. ETH is wrapped to WETH automatically.</div></div>
+  <div class="lpage">
+    <div class="lgrid">
+      <div class="card lform">
+        <h2 class="gtitle">Launch a token</h2>
+        <div class="muted lsub">One transaction creates your token and its bonding curve. When the curve fills, it graduates into a permanent Ammora pool.</div>
+
+        <label class="l">Image <span class="opt">optional</span></label>
+        <label class="drop" id="drop"><input type="file" id="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden/>
+          <div id="imgprev" class="avatar">＋</div>
+          <div><span class="dropbtn">Choose image</span><div class="muted" style="font-size:12px;margin-top:4px">PNG, JPEG, WebP or GIF · or drop it here</div></div></label>
+        <div class="help" id="metahelp">Stored fully on-chain, so it is compressed to fit.</div>
+
+        <div class="fgrid">
+          <div><label class="l">Name <span class="cnt" id="c-name">0/40</span></label><input class="inp" id="name" maxlength="40" placeholder="Name"/></div>
+          <div><label class="l">Ticker <span class="cnt" id="c-sym">0/12</span></label><input class="inp" id="sym" maxlength="12" placeholder="Ticker"/></div>
+        </div>
+
+        <div class="lbox">
+          <label class="l">Description and links <span class="opt">optional</span></label>
+          <textarea class="inp" id="desc" maxlength="280" placeholder="What is it, and why hold it?"></textarea>
+          <div class="cnt" style="float:none;text-align:right;margin-top:4px" id="c-desc">0/280</div>
+          <div class="linkrow">
+            <label class="pfx"><span>x.com/</span><input id="tw" placeholder="handle" autocomplete="off"/></label>
+            <label class="pfx"><span>t.me/</span><input id="tg" placeholder="group" autocomplete="off"/></label>
+            <label class="pfx"><span>https://</span><input id="web" placeholder="website" autocomplete="off"/></label>
+          </div>
+        </div>
+
+        ${PRESETS.length > 1 ? `<label class="l">Launch type <span class="opt">fixed at launch</span></label>
+        <div class="segctl" id="presets">${PRESETS.map((p, i) => `<button type="button" class="preset ${i === 0 ? "on" : ""}" data-i="${i}">${esc(p.name)}</button>`).join("")}</div>
+        <div class="help" id="presetdesc">${esc(PRESETS[0].description || "")}</div>` : ""}
+
+        <label class="l" style="margin-top:18px">Your first buy <span class="opt">optional</span></label>
+        <div class="swpanel lbuy"><div class="swmid"><input id="first" inputmode="decimal" placeholder="0" autocomplete="off"/><span class="assetbtn"><div class="avatar sm eth">Ξ</div><b>ETH</b></span></div></div>
+        <div class="quick" id="fquick">${["0", "0.001", "0.005", "0.01"].map((v, i) => `<button type="button" data-v="${v}" class="${i === 0 ? "on" : ""}">${v === "0" ? "None" : v + " ETH"}</button>`).join("")}</div>
+        <div class="help" id="firsthelp">Bought in the same transaction as the launch, so nobody can buy before you.</div>
+
+        <div class="lfoot">
+          <div id="cmsg"></div>
+          <div class="still" id="still"></div>
+          <button class="btn grad block swgo" id="launch">${W.address ? "Launch token" : "Connect wallet"}</button>
+          <div class="swfoot"><span>Free to launch, network fee only</span><span>·</span><span id="feeline">1% fee per trade</span></div>
+        </div>
+      </div>
+      <aside class="lprev">
+        <div class="pvlabel">How Explore lists it</div>
+        <div class="card pvcard">
+          <div class="pvhead"><div id="pvimg" class="avatar">?</div>
+            <div style="min-width:0"><div class="pvname" id="pvname">Your token</div><div class="muted" id="pvsym">$TICKER</div></div></div>
+          <div class="pvcap"><b id="pvcap">—</b><span>opening market cap</span></div>
+          <div class="pvdesc muted" id="pvdesc"></div>
+          <div id="cfginfo" class="pvrows"><div class="skel" style="height:14px"></div><div class="skel" style="height:14px"></div><div class="skel" style="height:14px"></div></div>
+          <div class="pvpay"><span>You pay</span><b id="pvpay">0 ETH</b></div>
+        </div>
+      </aside>
     </div>
-    <div id="cmsg"></div>
-    <button class="btn grad block" id="launch" style="margin-top:16px">${W.address ? "Launch token" : "Connect wallet & launch"}</button>
-    <div class="note">You become the token's Creator and receive the Creator share of curve trading fees defined by the Config. GIWA Sepolia testnet only.</div>
   </div>`;
 
   let cfg = null, imgBmp = null, fitted = null;
+  // Live preview on the right + "still needed" hint above the button.
+  const updatePreview = () => {
+    const name = $("#name").value.trim(), sym = $("#sym").value.trim().toUpperCase(), desc = $("#desc").value.trim();
+    $("#pvname").textContent = name || "Your token";
+    $("#pvsym").textContent = "$" + (sym || "TICKER");
+    $("#pvdesc").textContent = desc;
+    $("#c-name").textContent = `${name.length}/40`; $("#c-sym").textContent = `${sym.length}/12`; $("#c-desc").textContent = `${desc.length}/280`;
+    let first = 0n;
+    try { const v = $("#first").value.trim(); first = v ? parseUnits(v, 18) : 0n; } catch {}
+    document.querySelectorAll("#fquick button").forEach((b) => b.classList.toggle("on", (b.dataset.v === "0" && first === 0n) || (first > 0n && b.dataset.v === $("#first").value.trim())));
+    const fee = cfg ? cfg.config.poolCreationFee : 0n;
+    $("#pvpay").textContent = `${fmtUnits(fee + first, 18, 6)} ETH`;
+    const need = [!name && "a name", !sym && "a ticker"].filter(Boolean);
+    $("#still").innerHTML = need.length ? `Still needed: ${need.map((n) => `<b>${n}</b>`).join(" and ")}` : "";
+    const get = $("#pv-get");
+    if (get) {
+      if (!cfg || first <= 0n) get.textContent = "None";
+      else {
+        const q = freshCurveBuyQuote(cfg.config, cfg.segments, first);
+        get.textContent = q.unfilled > 0n ? "Too large for the curve" : `${fmtUnits(q.amountOut, cfg.config.tokenDecimals)} ${sym || "tokens"}`;
+      }
+    }
+  };
   const loadCfg = async () => {
     const want = cfgId;
     $("#cmsg").innerHTML = "";
-    $("#cfginfo").innerHTML = `<div class="skel" style="height:18px"></div><div class="skel" style="height:18px"></div>`;
+    $("#cfginfo").innerHTML = `<div class="skel" style="height:14px"></div><div class="skel" style="height:14px"></div><div class="skel" style="height:14px"></div>`;
     try {
       const bn = await pc.getBlockNumber();
       const entry = await A.getAmmoraV4ConfigAtBlock(pc, L.configRegistry, want, bn);
       if (id !== renderId || want !== cfgId) return;
       cfg = entry;
       const c = cfg.config;
-      const sched = Number(c.feeSchedulerMode) !== 0;
-      const endFee = sched ? Number(c.cliffFeeBps) - (Number(c.feeSchedulerMode) === 1 ? Number(c.feeReductionFactorBps) * Number(c.feeNumberOfPeriods) : 0) : Number(c.cliffFeeBps);
+      const sched = Number(c.feeSchedulerMode) === 1;
+      const endFee = sched ? Number(c.cliffFeeBps) - Number(c.feeReductionFactorBps) * Number(c.feeNumberOfPeriods) : Number(c.cliffFeeBps);
+      const supply = Number(formatUnits(c.totalSupply, c.tokenDecimals));
+      const feeText = sched ? `${(c.cliffFeeBps / 100).toFixed(0)}% → ${(endFee / 100).toFixed(0)}% in ${Math.round(Number(c.feeNumberOfPeriods) * Number(c.feePeriodFrequency) / 60)} min` : `${(c.cliffFeeBps / 100).toFixed(0)}%`;
+      $("#pvcap").textContent = mc(sqrtToPrice(c.startSqrtPrice, c.tokenDecimals) * supply, 4);
+      $("#feeline").textContent = sched ? `${feeText} fee per trade` : `${feeText} fee per trade`;
       $("#cfginfo").innerHTML = `
-        <div><span class="muted">Config</span> <b>#${want}</b> ${cfg.enabled ? '<span class="good">enabled</span>' : '<span class="bad">disabled</span>'}</div>
-        <div><span class="muted">Creation fee</span> <b>${formatUnits(c.poolCreationFee, 18)} ETH</b></div>
-        <div><span class="muted">Total supply</span> <b>${fmtUnits(c.totalSupply, c.tokenDecimals)}</b> (${c.tokenDecimals} decimals)</div>
-        <div><span class="muted">Graduates at</span> <b>${fmtUnits(c.migrationQuoteThreshold, 18)} WETH</b></div>
-        <div><span class="muted">Curve fee</span> <b>${sched && Number(c.feeSchedulerMode) === 1 ? `${(c.cliffFeeBps / 100).toFixed(0)}% → ${(endFee / 100).toFixed(0)}% over ${Math.round(Number(c.feeNumberOfPeriods) * Number(c.feePeriodFrequency) / 60)} min` : `${(c.cliffFeeBps / 100).toFixed(2)}%`}</b> · creator share ${(c.creatorShareOfNonProtocolBps / 100).toFixed(0)}%</div>
-        <div><span class="muted">Partner</span> <a class="mono" href="${addrUrl(c.partnerRecipient)}" target="_blank" rel="noopener">${short(c.partnerRecipient)}</a></div>`;
+        <div><span>Fee per trade</span><b>${feeText}</b></div>
+        <div><span>Graduates at</span><b>${fmtUnits(c.migrationQuoteThreshold, 18)} ETH</b></div>
+        <div><span>Supply</span><b>${fmtUnits(c.totalSupply, c.tokenDecimals)}</b></div>
+        <div><span>First buy</span><b id="pv-get">None</b></div>`;
       $("#firsthelp").innerHTML = sched
-        ? `Bought in the same transaction as the launch. On an anti-sniper launch this first buy also pays the <b>${(c.cliffFeeBps / 100).toFixed(0)}% launch fee</b>, so keep it small or skip it.`
-        : "Bought in the same transaction as the launch, so nobody can buy before you. ETH is wrapped to WETH automatically.";
-      if (!cfg.enabled) $("#cmsg").innerHTML = `<div class="alert err">Config #${want} is disabled. Update the launch presets in src/config.js.</div>`;
+        ? `On an anti-sniper launch your first buy also pays the <b>${(c.cliffFeeBps / 100).toFixed(0)}% launch fee</b>, so keep it small or skip it.`
+        : "Bought in the same transaction as the launch, so nobody can buy before you.";
+      if (!cfg.enabled) $("#cmsg").innerHTML = `<div class="alert err">This launch type is not available right now.</div>`;
+      updatePreview();
     } catch (e) {
-      if (id === renderId && want === cfgId) $("#cfginfo").innerHTML = `<div class="alert err" style="grid-column:1/-1">Could not read Config #${want}: ${esc(errText(e))}</div>`;
+      if (id === renderId && want === cfgId) $("#cfginfo").innerHTML = `<div class="alert err">Could not load launch settings: ${esc(errText(e))}</div>`;
     }
   };
   document.querySelectorAll("#presets .preset").forEach((b) => (b.onclick = () => {
     document.querySelectorAll("#presets .preset").forEach((x) => x.classList.toggle("on", x === b));
-    cfgId = PRESETS[Number(b.dataset.i)].id;
+    const p = PRESETS[Number(b.dataset.i)];
+    cfgId = p.id;
+    $("#presetdesc").textContent = p.description || "";
     cfg = null;
     loadCfg();
   }));
+  document.querySelectorAll("#fquick button").forEach((b) => (b.onclick = () => { $("#first").value = b.dataset.v === "0" ? "" : b.dataset.v; updatePreview(); }));
+  ["#name", "#sym", "#desc", "#first"].forEach((sel) => $(sel).addEventListener("input", updatePreview));
+  updatePreview();
+  // Drag & drop an image onto the picker.
+  const drop = $("#drop");
+  ["dragenter", "dragover"].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+  ["dragleave", "drop"].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+  drop.addEventListener("drop", (e) => {
+    const f = e.dataTransfer?.files?.[0];
+    if (f) { const dt = new DataTransfer(); dt.items.add(f); $("#file").files = dt.files; $("#file").dispatchEvent(new Event("change")); }
+  });
   await loadCfg();
 
-  const setPrev = (src) => { $("#imgprev").outerHTML = src ? `<img id="imgprev" class="avatar lg" src="${esc(src)}" alt="">` : `<div id="imgprev" class="avatar lg">?</div>`; };
+  const setPrev = (src) => {
+    for (const idSel of ["imgprev", "pvimg"]) {
+      const el = document.getElementById(idSel);
+      if (!el) continue;
+      el.outerHTML = src ? `<img id="${idSel}" class="avatar" src="${esc(src)}" alt="">` : `<div id="${idSel}" class="avatar">${idSel === "imgprev" ? "＋" : "?"}</div>`;
+    }
+  };
+  // Links are typed as handles (x.com/<handle>, t.me/<group>) or a bare domain; full URLs work too.
+  const linkVal = (sel, base) => {
+    let v = $(sel).value.trim();
+    if (!v) return undefined;
+    if (!/^https?:\/\//i.test(v)) v = base + v.replace(/^@/, "").replace(/^(x\.com|twitter\.com|t\.me)\//i, "");
+    return safeUrl(v) || undefined;
+  };
   const baseMeta = () => ({
     name: $("#name").value.trim(), symbol: $("#sym").value.trim().toUpperCase(),
     description: $("#desc").value.trim() || undefined,
-    website: safeUrl($("#web").value.trim()) || undefined, twitter: safeUrl($("#tw").value.trim()) || undefined, telegram: safeUrl($("#tg").value.trim()) || undefined,
+    website: linkVal("#web", "https://"), twitter: linkVal("#tw", "https://x.com/"), telegram: linkVal("#tg", "https://t.me/"),
     launchpad: SITE.name,
   });
   // Recompute the exact on-chain metadata (and the image size that fits) whenever an input changes.
@@ -1452,7 +1859,7 @@ async function viewCreate(id) {
         const used = utf8Bytes(fitted.uri);
         $("#metahelp").innerHTML = fitted.tooBig
           ? `<span class="bad">The image does not fit next to this much text. Shorten the description or links (on-chain limit ${META_LIMIT.toLocaleString("en-US")} bytes).</span>`
-          : `On-chain metadata: <b>${used.toLocaleString("en-US")} / ${META_LIMIT.toLocaleString("en-US")} bytes</b>${fitted.image ? ` · image compressed to ${fitted.size}px` : ""}.`;
+          : `Stored fully on-chain · ${used.toLocaleString("en-US")} / ${META_LIMIT.toLocaleString("en-US")} bytes used${fitted.image ? ` · image ${fitted.size}px` : ""}`;
       } catch (e) {
         fitted = null;
         $("#metahelp").innerHTML = `<span class="bad">${esc(e.message)}</span>`;
@@ -1690,11 +2097,13 @@ async function render() {
   renderHeader();
   const [route, arg] = location.hash.replace(/^#\/?/, "").split("/");
   window.scrollTo(0, 0);
+  // Explore uses the full screen width for its token board.
+  app.classList.toggle("wide", !route || route === "explore");
   if (route === "token" && arg) return viewToken(id, arg);
   if (route === "create") return viewCreate(id);
   if (route === "wallet") return viewWallet(id);
   if (route === "swap") return viewSwap(id, arg);
-  if (route === "earnings") return viewEarnings(id);
+  if (route === "portfolio" || route === "earnings") return viewPortfolio(id);
   if (route === "setup") return viewSetup(id);
   return viewExplore(id);
 }
@@ -1703,6 +2112,28 @@ if (SITE.links?.x || SITE.links?.github) {
   $("#footlinks").innerHTML += [SITE.links.x && ` · <a href="${esc(SITE.links.x)}" target="_blank" rel="noopener">X</a>`, SITE.links.github && ` · <a href="${esc(SITE.links.github)}" target="_blank" rel="noopener">GitHub</a>`].filter(Boolean).join("");
 }
 render();
+
+/* ───────────────────────────── ticker (under the header, on every page) ───────────────────────────── */
+// Scrolling strip of this launchpad's tokens. Hover pauses it; click opens the token.
+function renderTicker(list) {
+  const t = $("#ticker"), track = $("#ttrack");
+  if (!t || !track) return;
+  const items = list.filter((x) => isSiteConfig(x.configId) && (x.status === 1 || x.status === 2 || x.status === 3) && !isHidden(x.token, x.curve))
+    .sort((a, b) => isOfficial(b) - isOfficial(a) || (b.mcap || 0) - (a.mcap || 0)).slice(0, 24);
+  if (items.length < 3) { t.hidden = true; return; }
+  const one = items.map((x) => `<a class="titem" href="#/token/${x.curve}" title="${esc(x.name || "")}">
+      ${avatar(x, "sm")}<b>${esc(x.symbol || "?")}</b>${officialBadge(x)}
+      <span class="tcap">${mc(x.mcap, 4)}</span>
+      ${x.status === 3 ? `<span class="tchip grad">Graduated</span>` : `<span class="tchip">${pct(x.progress, 0)}%</span>`}</a>`).join("");
+  // The list is repeated twice so the loop is seamless; the speed scales with its length.
+  track.innerHTML = `<div class="tgroup">${one}</div><div class="tgroup" aria-hidden="true">${one}</div>`;
+  track.style.setProperty("--tdur", `${Math.max(30, items.length * 5)}s`);
+  t.hidden = false;
+}
+const refreshTicker = () => loadLaunches().then(renderTicker).catch(() => {});
+setTimeout(refreshTicker, 300);
+refreshEthUsd(); setInterval(refreshEthUsd, 5 * 60_000);
+setInterval(refreshTicker, 60_000);
 // Warm the browser cache for the swap module once the first page is on screen.
 setTimeout(() => (window.requestIdleCallback || ((f) => setTimeout(f, 1)))(() => loadSwapModule().catch(() => {})), 2500);
 
