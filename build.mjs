@@ -6,7 +6,7 @@
 //   npm run build    → dist/index.html, dist/assets/*, dist/_headers, dist/.nojekyll
 import { build } from "esbuild";
 import { createHash } from "node:crypto";
-import { copyFile, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 const RPC = "https://sepolia-rpc.giwa.io";
@@ -72,9 +72,9 @@ const csp = [
   "default-src 'none'",
   "script-src 'self'",
   "style-src 'self' 'unsafe-inline'",
-  "img-src data: blob:",
+  "img-src data: blob: https:", // https only for wallet logos in the wallet picker; token images stay data: only
   "font-src 'self'",
-  `connect-src ${RPC} ${EXPLORER}`,
+  `connect-src ${RPC} ${EXPLORER} https://api.coinbase.com https://api.coingecko.com`, // + ETH/USD reference price
   "base-uri 'none'",
   "form-action 'none'",
   "object-src 'none'",
@@ -114,6 +114,19 @@ await writeFile(join(OUT, "_headers"), `/*
 /index.html
   Cache-Control: no-cache
 `);
+
+// Make every output world-readable (files 644, folders 755). Web servers such as Apache answer
+// "403 Forbidden" for files that only the owner may read, and writing over an existing file keeps
+// its old permissions, so set them explicitly on every build.
+async function fixPermissions(dir) {
+  await chmod(dir, 0o755);
+  for (const name of await readdir(dir)) {
+    const p = join(dir, name);
+    if ((await stat(p)).isDirectory()) await fixPermissions(p);
+    else await chmod(p, 0o644);
+  }
+}
+await fixPermissions(OUT);
 
 // Summary
 console.log(`dist/index.html          ${kb(html.length)}`);

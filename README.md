@@ -85,7 +85,7 @@ Transactions are signed in the visitor's own wallet extension.
 ## Security notes
 
 - **CSP:** Scripts, styles and fonts may only come from the site itself (`'self'`); the page may only
-  contact the GIWA RPC and explorer. The main script and CSS also carry SRI hashes, so a modified file
+  contact the GIWA RPC and explorer, plus a public ETH/USD price (Coinbase, CoinGecko as fallback) used to show market caps in dollars. The main script and CSS also carry SRI hashes, so a modified file
   is refused by the browser. Always edit `src/` and rebuild instead of editing `dist/` by hand.
 - **Speed:** The first visit loads ~170 KB of gzipped JavaScript. The Ammora swap router
   (`AmmoraSwapClient`, most of the SDK's size) is only needed for graduated tokens, so it is a

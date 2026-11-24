@@ -1,0 +1,2139 @@
+
+// Moralume — a token launchpad + bonding-curve exchange built on the Ammora SDK.
+// Everything on-chain goes through @ammora-protocol/sdk (Ammora V4 launch factory, ALC curve,
+// graduation/migration, ARL pool swaps, Config registry) on GIWA Sepolia.
+import * as A from "@ammora-protocol/sdk";
+import {
+  createPublicClient, createWalletClient, custom, http, defineChain, formatUnits, parseUnits,
+  erc20Abi, getAddress, isAddress, decodeEventLog, toEventSelector, encodeFunctionData, zeroAddress, toHex,
+} from "viem";
+
+import { SITE } from "./config.js";
+
+
+
+/* ───────────────────────────── deployment ───────────────────────────── */
+const D = A.giwaSepoliaAutoRouteDeployment;               // reviewed Ammora V4 auto-route catalog
+const L = D.contracts.launch;                             // factory, registry, adapter, fee policy …
+const CORE = { configRegistry: L.configRegistry, launchFactory: L.factory, graduationAdapter: L.graduationAdapter, feePolicy: L.feePolicy };
+const CHAIN_ID = D.chain.id;                              // 91342
+const RPC = D.chain.rpcUrls[0];                           // https://sepolia-rpc.giwa.io
+const EXPLORER = D.chain.blockExplorerUrl;                // https://sepolia-explorer.giwa.io
+const WETH = getAddress(D.contracts.tokens.wrappedNative);
+const MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11";
+const FACTORY_START = 36220000;
+
+const chain = defineChain({
+  id: CHAIN_ID, name: D.chain.name, nativeCurrency: D.chain.nativeCurrency,
+  rpcUrls: { default: { http: [RPC] } },
+  blockExplorers: { default: { name: "GIWA Explorer", url: EXPLORER } },
+  contracts: { multicall3: { address: MULTICALL3 } },
+});
+const pc = createPublicClient({
+  chain,
+  transport: http(RPC, { retryCount: 4, retryDelay: 700 }),
+  batch: { multicall: { wait: 16, batchSize: 4096 } },
+});
+
+const LAUNCH_EVENT = A.ammoraLaunchFactoryV4Abi.find((x) => x.type === "event" && x.name === "LaunchCreated");
+const SWAP_EVENT = A.ammoraLaunchPoolV4Abi.find((x) => x.type === "event" && x.name === "Swap");
+const LAUNCH_TOPIC = toEventSelector(LAUNCH_EVENT);
+const SWAP_TOPIC = toEventSelector(SWAP_EVENT);
+// After graduation trading happens in the token's Ammora ARL (concentrated) pool.
+const POOL_SWAP_EVENTS = A.ammConcentratedPoolV3Abi.filter((x) => x.type === "event" && (x.name === "Swap" || x.name === "SwapPartialFill"));
+const POOL_SWAP_TOPICS = POOL_SWAP_EVENTS.map((e) => toEventSelector(e));
+const wethAbi = [
+  { type: "function", name: "deposit", stateMutability: "payable", inputs: [], outputs: [] },
+  { type: "function", name: "withdraw", stateMutability: "nonpayable", inputs: [{ type: "uint256", name: "wad" }], outputs: [] },
+];
+
+const siteConfigId = () => BigInt(SITE.launchConfigId);
+// Launch presets (Standard, Anti-sniper, …). Presets without an id are not created yet and stay hidden.
+const PRESETS = ((SITE.launchPresets && SITE.launchPresets.length) ? SITE.launchPresets : [{ id: SITE.launchConfigId, name: "Standard" }])
+  .filter((p) => p.id !== null && p.id !== undefined).map((p) => ({ ...p, id: BigInt(p.id) }));
+const SITE_CONFIGS = new Set([siteConfigId(), ...PRESETS.map((p) => p.id)].map(String));
+const isSiteConfig = (cid) => cid !== undefined && cid !== null && SITE_CONFIGS.has(String(cid));
+const presetFor = (cid) => PRESETS.find((p) => String(p.id) === String(cid));
+const shieldBadge = (cid) => (presetFor(cid)?.antiSniper ? `<span class="badge b-shield" title="Anti-sniper launch: high fee at launch that decays to 1%">Anti-sniper</span>` : "");
+// Moderation: tokens listed in SITE.hiddenTokens (token or curve address) are not shown anywhere on this site.
+const HIDDEN = new Set((SITE.hiddenTokens || []).map((a) => String(a).toLowerCase()));
+const isHidden = (...addrs) => addrs.some((a) => a && HIDDEN.has(String(a).toLowerCase()));
+// "Official" tokens: launched on-chain by the launchpad's own wallet (or listed explicitly).
+const OFFICIAL_CREATORS = new Set((SITE.officialCreators || []).map((a) => String(a).toLowerCase()));
+const OFFICIAL_TOKENS = new Set((SITE.officialTokens || []).map((a) => String(a).toLowerCase()));
+const isOfficial = (x) => !!x && (OFFICIAL_TOKENS.size
+  ? [x.token, x.curve].some((a) => a && OFFICIAL_TOKENS.has(String(a).toLowerCase()))
+  : !!x.creator && OFFICIAL_CREATORS.has(String(x.creator).toLowerCase()));
+const officialBadge = (x) => (isOfficial(x) ? `<span class="badge b-official" title="Launched by the ${esc(SITE.name)} team">✓ Official</span>` : "");
+
+/* ───────────────────────────── night mode ───────────────────────────── */
+// Saved choice wins; otherwise follow the operating system setting.
+const THEME_KEY = "moralume.theme";
+const MOON_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11z"/></svg>`;
+const SUN_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></svg>`;
+const savedTheme = () => { try { return localStorage.getItem(THEME_KEY); } catch { return null; } };
+const systemDark = () => window.matchMedia?.("(prefers-color-scheme: dark)").matches;
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  const b = document.getElementById("theme");
+  if (b) { b.innerHTML = theme === "dark" ? SUN_ICON : MOON_ICON; b.title = theme === "dark" ? "Switch to day mode" : "Switch to night mode"; }
+}
+applyTheme(savedTheme() || (systemDark() ? "dark" : "light"));
+window.matchMedia?.("(prefers-color-scheme: dark)").addEventListener?.("change", (e) => { if (!savedTheme()) applyTheme(e.matches ? "dark" : "light"); });
+document.getElementById("theme")?.addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  try { localStorage.setItem(THEME_KEY, next); } catch {}
+  applyTheme(next);
+});
+
+/* ───────────────────────────── small helpers ───────────────────────────── */
+const $ = (sel, root = document) => root.querySelector(sel);
+const app = $("#app");
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const short = (a) => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : "");
+const txUrl = (h) => `${EXPLORER}/tx/${h}`;
+const addrUrl = (a) => `${EXPLORER}/address/${a}`;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const nowSec = () => BigInt(Math.floor(Date.now() / 1000));
+const bnJson = (v) => JSON.stringify(v, (_, x) => (typeof x === "bigint" ? x.toString() : x));
+
+function fmtNum(n, digits = 4) {
+  if (!isFinite(n)) return "—";
+  if (n === 0) return "0";
+  const a = Math.abs(n);
+  if (a >= 1e9) return (n / 1e9).toFixed(2) + "B";
+  if (a >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (a >= 1e4) return (n / 1e3).toFixed(1) + "K";
+  if (a >= 1) return n.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  if (a >= 1e-4) return n.toLocaleString("en-US", { maximumSignificantDigits: digits });
+  return fmtTiny(n);
+}
+// 0.0₉214 style for very small prices
+function fmtTiny(p) {
+  if (!p) return "0";
+  const e = Math.floor(-Math.log10(p));
+  const sig = Math.round(p * 10 ** (e + 2));
+  return `0.0<sub>${e - 1}</sub>${String(sig).replace(/0+$/, "") || "0"}`;
+}
+const fmtUnits = (v, dec, digits) => fmtNum(Number(formatUnits(v ?? 0n, dec)), digits);
+const sqrtToPrice = (sqrtQ64, baseDec, quoteDec = 18) => {
+  const s = Number(sqrtQ64) / 2 ** 64;
+  return s * s * 10 ** (baseDec - quoteDec);
+};
+const errText = (e) => {
+  if (!e) return "Unknown error";
+  if (e.code === 4001 || /User (rejected|denied)/i.test(e.message || "")) return "Request rejected in your wallet.";
+  // SDK errors carry the underlying contract revert in details.causeMessage.
+  const cause = e.details && typeof e.details === "object" ? String(e.details.causeMessage || "") : "";
+  const reason = (cause || e.shortMessage || e.message || "").match(/Error: (\w+)\(/)?.[1];
+  if (reason === "PriceRangeViolation") return "This amount is larger than the pool's liquidity range allows. Try a smaller amount.";
+  const base = e.shortMessage || (typeof e.details === "string" ? e.details : "") || e.message || String(e);
+  return reason ? `${base} (${reason})` : base;
+};
+function toast(html, kind = "", ms = 6000) {
+  // Don't stack the same message again and again (e.g. repeated clicks).
+  for (const t of $("#toasts").children) if (t.innerHTML === html) { t.remove(); }
+  const el = document.createElement("div");
+  el.className = `toast ${kind}`;
+  el.innerHTML = html;
+  $("#toasts").appendChild(el);
+  setTimeout(() => el.remove(), ms);
+}
+function timeAgo(sec) {
+  if (!sec) return "";
+  const d = Date.now() / 1000 - sec;
+  if (d < 60) return "just now";
+  if (d < 3600) return `${Math.floor(d / 60)}m ago`;
+  if (d < 86400) return `${Math.floor(d / 3600)}h ago`;
+  return `${Math.floor(d / 86400)}d ago`;
+}
+
+/* ───────────────────────────── metadata ───────────────────────────── */
+const b64ToUtf8 = (b) => new TextDecoder().decode(Uint8Array.from(atob(b), (c) => c.charCodeAt(0)));
+// Outbound links shown on token pages (website / X / Telegram): https only.
+const safeUrl = (u) => {
+  if (!u || typeof u !== "string" || u.length > 300) return null;
+  try { const x = new URL(u); return x.protocol === "https:" ? x.href : null; } catch { return null; }
+};
+// Images: only inline data: images stored in the on-chain metadata (no remote image loads).
+const safeImg = (u) => (typeof u === "string" && u.length < 200_000 && /^data:image\/(png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=]+$/i.test(u) ? u : null);
+
+const metaCache = new Map();
+// Privacy: metadata is read ONLY from on-chain data: URIs. Remote (https/ipfs) metadata is never
+// fetched, so token creators cannot learn visitors' IP addresses through a metadata link.
+async function readMetadata(uri) {
+  if (!uri) return {};
+  if (metaCache.has(uri)) return metaCache.get(uri);
+  let out = {};
+  try {
+    if (uri.startsWith("data:application/json;base64,")) out = JSON.parse(b64ToUtf8(uri.slice(29)));
+    else if (uri.startsWith("data:application/json,")) out = JSON.parse(decodeURIComponent(uri.slice(22)));
+  } catch { out = {}; }
+  if (!out || typeof out !== "object" || Array.isArray(out)) out = {};
+  metaCache.set(uri, out);
+  return out;
+}
+
+/* ───────────────────────────── wallet ───────────────────────────── */
+const W = { address: null, chainId: null, wc: null };
+
+// Wallet discovery (EIP-6963): every installed wallet extension announces itself, so visitors with
+// several wallets (MetaMask + OKX + Phantom + Rabby …) can pick one instead of whichever extension
+// grabbed window.ethereum. That "winner" is often a wallet with EVM disabled or locked, and it
+// rejects every request instantly without showing a popup.
+const WALLETS = []; // { info: { uuid, name, icon, rdns }, provider }
+const WALLET_KEY = "moralume.wallet";
+window.addEventListener("eip6963:announceProvider", (e) => {
+  const d = e.detail;
+  if (!d?.info?.rdns || !d.provider?.request) return;
+  if (!WALLETS.some((w) => w.info.rdns === d.info.rdns)) WALLETS.push(d);
+});
+window.dispatchEvent(new Event("eip6963:requestProvider"));
+const savedWallet = () => { try { return localStorage.getItem(WALLET_KEY); } catch { return null; } };
+let current = null; // the provider in use
+const eth = () => current || WALLETS.find((w) => w.info.rdns === savedWallet())?.provider || window.ethereum || WALLETS[0]?.provider;
+
+// "Disconnected" is remembered so the site does not silently re-attach the wallet on reload.
+const DISCONNECTED = "moralume.walletDisconnected";
+const setDisconnected = (v) => { try { v ? localStorage.setItem(DISCONNECTED, "1") : localStorage.removeItem(DISCONNECTED); } catch {} };
+const isDisconnected = () => { try { return localStorage.getItem(DISCONNECTED) === "1"; } catch { return false; } };
+
+const onAccounts = (a) => {
+  if (isDisconnected()) return;
+  W.address = a?.[0] ? getAddress(a[0]) : null;
+  W.wc = W.address ? createWalletClient({ chain, transport: custom(eth()) }) : null;
+  renderHeader(); render();
+};
+const onChain = (c) => { W.chainId = Number(c); renderHeader(); };
+let listening = null;
+function useProvider(p) {
+  if (listening && listening !== p) { listening.removeListener?.("accountsChanged", onAccounts); listening.removeListener?.("chainChanged", onChain); }
+  current = p;
+  if (p && listening !== p) { p.on?.("accountsChanged", onAccounts); p.on?.("chainChanged", onChain); listening = p; }
+}
+
+// Wallet picker: shown when more than one wallet is installed.
+function pickWallet() {
+  return new Promise((resolve, reject) => {
+    const bg = document.createElement("div");
+    bg.className = "modal-bg";
+    // Wallets announce their logo as a data: URI (most) or an https URL (some, e.g. Phantom).
+    const iconSrc = (w) => { const u = String(w.info.icon || "").trim(); return /^data:image\//i.test(u) || /^https:\/\//i.test(u) ? u : ""; };
+    const icon = (w) => iconSrc(w) ? `<img src="${esc(iconSrc(w))}" alt="" data-letter="${esc((w.info.name || "?").slice(0, 1))}" />` : `<span>${esc((w.info.name || "?").slice(0, 1))}</span>`;
+    bg.innerHTML = `<div class="modal"><h3>Connect a wallet</h3>
+      <div class="muted" style="margin-bottom:12px">Choose the wallet you want to use on ${esc(SITE.name)}.</div>
+      <div class="wlist">${WALLETS.map((w, i) => `<button class="wopt" data-i="${i}">${icon(w)}<b>${esc(w.info.name || w.info.rdns)}</b>
+        ${w.info.rdns === savedWallet() ? '<em>Last used</em>' : ""}</button>`).join("")}</div>
+      <button class="btn ghost block" data-x style="margin-top:12px">Cancel</button></div>`;
+    const close = () => bg.remove();
+    bg.onclick = (e) => {
+      const o = e.target.closest(".wopt");
+      if (o) { close(); resolve(WALLETS[Number(o.dataset.i)]); }
+      else if (e.target === bg || e.target.closest("[data-x]")) { close(); reject(Object.assign(new Error("cancelled"), { cancelled: true })); }
+    };
+    document.body.appendChild(bg);
+    bg.querySelectorAll(".wopt img").forEach((im) => im.addEventListener("error", () => {
+      const sp = document.createElement("span"); sp.textContent = im.dataset.letter || "?"; im.replaceWith(sp);
+    }));
+  });
+}
+
+async function connect(pickAccount = false) {
+  await sleep(0); // let wallets finish announcing themselves
+  const saved = WALLETS.find((w) => w.info.rdns === savedWallet());
+  let chosen = null;
+  if (WALLETS.length > 1) chosen = await pickWallet(); // always let the visitor choose; last used is marked
+  else chosen = saved || WALLETS[0] || null;
+  const p = chosen?.provider || window.ethereum;
+  if (!p) {
+    toast('No browser wallet found. Install <a href="https://metamask.io" target="_blank" rel="noopener noreferrer">MetaMask</a> or another EVM wallet.', "err", 9000);
+    throw new Error("No wallet");
+  }
+  useProvider(p);
+  if (chosen) { try { localStorage.setItem(WALLET_KEY, chosen.info.rdns); } catch {} }
+  const started = Date.now();
+  try {
+    // After a disconnect (or on "Switch wallet") ask the wallet to show its account picker again.
+    // Not every wallet supports this, so any failure just falls through to eth_requestAccounts.
+    if (pickAccount || isDisconnected()) {
+      try { await p.request({ method: "wallet_requestPermissions", params: [{ eth_accounts: {} }] }); } catch {}
+    }
+    const [addr] = await p.request({ method: "eth_requestAccounts" });
+    if (!addr) throw new Error("No account selected in your wallet.");
+    setDisconnected(false);
+    W.address = getAddress(addr);
+    W.chainId = Number(await p.request({ method: "eth_chainId" }));
+    W.wc = createWalletClient({ chain, transport: custom(p) });
+    renderHeader();
+    return W.address;
+  } catch (e) {
+    // A rejection that comes back almost instantly never showed a popup: the wallet is locked,
+    // has EVM turned off, or another extension answered. Say so instead of "you rejected it".
+    if (e?.code === 4001 && Date.now() - started < 700) {
+      const name = chosen?.info?.name || "Your wallet";
+      throw new Error(`${name} refused without opening a popup. Unlock it, make sure it supports EVM networks${WALLETS.length > 1 ? ", or click Connect wallet and pick another wallet" : ""}.`);
+    }
+    if (e?.code === -32002) throw new Error("A connection request is already open in your wallet. Open the wallet extension to approve it.");
+    throw e;
+  }
+}
+async function disconnect() {
+  // Revoke this site's account permission where the wallet supports it (MetaMask does);
+  // otherwise just forget the account locally.
+  try { await eth()?.request({ method: "wallet_revokePermissions", params: [{ eth_accounts: {} }] }); } catch {}
+  setDisconnected(true);
+  W.address = null; W.wc = null;
+  closeWalletMenu();
+  renderHeader(); render();
+  toast("Wallet disconnected.");
+}
+async function ensureChain() {
+  if (W.chainId === CHAIN_ID) return;
+  try {
+    await eth().request({ method: "wallet_switchEthereumChain", params: [{ chainId: toHex(CHAIN_ID) }] });
+  } catch (e) {
+    if (e.code === 4902 || /Unrecognized|not been added|unknown chain/i.test(e.message || "")) {
+      await eth().request({ method: "wallet_addEthereumChain", params: [{
+        chainId: toHex(CHAIN_ID), chainName: "GIWA Sepolia", nativeCurrency: D.chain.nativeCurrency,
+        rpcUrls: [RPC], blockExplorerUrls: [EXPLORER],
+      }] });
+    } else throw e;
+  }
+  W.chainId = Number(await eth().request({ method: "eth_chainId" }));
+  renderHeader();
+  if (W.chainId !== CHAIN_ID) throw new Error("Please switch your wallet to GIWA Sepolia.");
+}
+async function ensureWallet() {
+  if (!W.address) await connect();
+  await ensureChain();
+  return W.address;
+}
+// Silent reconnect on page load (no popup): only if the wallet already trusts this site.
+setTimeout(() => {
+  const p = eth();
+  if (!p || isDisconnected()) return;
+  useProvider(p);
+  p.request({ method: "eth_accounts" }).then(async (a) => {
+    if (a?.[0] && !isDisconnected() && !W.address) {
+      W.address = getAddress(a[0]);
+      W.chainId = Number(await p.request({ method: "eth_chainId" }));
+      W.wc = createWalletClient({ chain, transport: custom(p) });
+      renderHeader(); render();
+    }
+  }).catch(() => {});
+}, 50);
+
+function renderHeader() {
+  const f = $("#faucet");
+  if (f) { const u = safeUrl(SITE.faucetUrl || ""); if (u) f.href = u; else f.remove(); }
+  $("#brand").textContent = SITE.name;
+  document.title = `${SITE.name} | Token Launchpad on GIWA, powered by Ammora`;
+  const btn = $("#connect");
+  btn.textContent = W.address ? `${short(W.address)} ▾` : "Connect wallet";
+  btn.className = W.address ? "btn ghost" : "btn dark";
+  const net = $("#net");
+  const wrong = W.address && W.chainId !== CHAIN_ID;
+  net.className = "netpill" + (wrong ? " wrong" : "");
+  net.innerHTML = wrong ? `<i class="dot"></i><b>Wrong network</b><span>Switch</span>` : `<i class="dot"></i><b>GIWA</b><span>Testnet</span>`;
+  net.title = wrong ? "Click to switch to GIWA Sepolia" : "GIWA Sepolia testnet";
+  const route = (location.hash.replace(/^#\/?/, "").split("/")[0]) || "";
+  document.querySelectorAll(".links a").forEach((a) => a.classList.toggle("active", a.dataset.route === (route === "earnings" ? "portfolio" : route)));
+}
+// Connected: the address button opens a small menu (copy, explorer, switch wallet, disconnect).
+function closeWalletMenu() { $("#wmenu")?.remove(); }
+function openWalletMenu() {
+  closeWalletMenu();
+  const m = document.createElement("div");
+  m.id = "wmenu";
+  m.className = "wmenu";
+  m.innerHTML = `<div class="wmenu-addr mono">${esc(W.address)}</div>
+    <button data-a="portfolio">Portfolio</button>
+    <button data-a="copy">Copy address</button>
+    <button data-a="explorer">View on explorer ↗</button>
+    <button data-a="switch">Switch wallet</button>
+    <button data-a="disconnect" class="danger">Disconnect</button>`;
+  document.body.appendChild(m);
+  const r = $("#connect").getBoundingClientRect();
+  m.style.top = `${r.bottom + 8}px`;
+  m.style.right = `${Math.max(12, window.innerWidth - r.right)}px`;
+  m.querySelectorAll("button").forEach((b) => (b.onclick = async () => {
+    const act = b.dataset.a;
+    if (act === "portfolio") { closeWalletMenu(); location.hash = "#/portfolio"; }
+    if (act === "copy") { try { await navigator.clipboard.writeText(W.address); toast("Address copied."); } catch { toast("Could not copy.", "err"); } closeWalletMenu(); }
+    if (act === "explorer") { window.open(addrUrl(W.address), "_blank", "noopener,noreferrer"); closeWalletMenu(); }
+    if (act === "switch") { closeWalletMenu(); try { await connect(true); await ensureChain(); render(); } catch (e) { if (e.message !== "No wallet" && !e.cancelled) toast(esc(errText(e)), "err"); } }
+    if (act === "disconnect") await disconnect();
+  }));
+}
+document.addEventListener("click", (e) => { if (!e.target.closest("#wmenu") && !e.target.closest("#connect")) closeWalletMenu(); });
+window.addEventListener("hashchange", closeWalletMenu);
+
+$("#connect").onclick = async () => {
+  if (W.address) { $("#wmenu") ? closeWalletMenu() : openWalletMenu(); return; }
+  try { await connect(); await ensureChain(); render(); } catch (e) { if (e.message !== "No wallet" && !e.cancelled) toast(esc(errText(e)), "err"); }
+};
+$("#net").onclick = () => { if (W.address && W.chainId !== CHAIN_ID) ensureChain().catch((e) => toast(esc(errText(e)), "err")); };
+
+/* ───────────────────────────── transactions ───────────────────────────── */
+// Multi-step modal: every step is shown, run in order, and its result is reported.
+function stepModal(title, steps) {
+  const bg = document.createElement("div");
+  bg.className = "modal-bg";
+  bg.innerHTML = `<div class="modal"><h3>${esc(title)}</h3>
+    <div class="txsteps">${steps.map((s, i) => `<div class="txstep" data-i="${i}"><i></i><span>${esc(s.label)}</span></div>`).join("")}</div>
+    <div class="msg"></div><button class="btn ghost block close" style="display:none">Close</button></div>`;
+  document.body.appendChild(bg);
+  const close = () => bg.remove();
+  $(".close", bg).onclick = close;
+  return {
+    async run() {
+      const results = [];
+      for (let i = 0; i < steps.length; i++) {
+        const el = $(`.txstep[data-i="${i}"]`, bg);
+        el.className = "txstep run";
+        try {
+          results.push(await steps[i].run(results));
+          el.className = "txstep done"; $("i", el).textContent = "✓";
+        } catch (e) {
+          el.className = "txstep fail"; $("i", el).textContent = "!";
+          $(".msg", bg).innerHTML = `<div class="alert err">${esc(errText(e))}</div>`;
+          $(".close", bg).style.display = "block";
+          throw e;
+        }
+      }
+      setTimeout(close, 900);
+      return results;
+    },
+    close,
+    msg(html) { $(".msg", bg).innerHTML = html; },
+  };
+}
+
+// Simulate against current state, ask the wallet to sign, wait for a successful receipt.
+async function sendTx({ to, data, value = 0n }, label = "Transaction") {
+  const account = W.address;
+  // Simulate first so reverts surface before signing. Public RPC replicas can lag a few
+  // seconds behind a just-confirmed approval/wrap, so retry briefly before giving up.
+  for (let i = 0; ; i++) {
+    try { await pc.call({ account, to, data, value }); break; }
+    catch (e) { if (i >= 3 || e.code === 4001) throw e; await sleep(2500); }
+  }
+  const hash = await W.wc.sendTransaction({ account, chain, to, data, value });
+  toast(`${esc(label)} sent · <a href="${txUrl(hash)}" target="_blank" rel="noopener">view</a>`);
+  const receipt = await pc.waitForTransactionReceipt({ hash, pollingInterval: 1500, timeout: 180_000 });
+  if (receipt.status !== "success") throw new Error(`${label} reverted (${hash})`);
+  toast(`${esc(label)} confirmed · <a href="${txUrl(hash)}" target="_blank" rel="noopener">view</a>`, "ok");
+  return receipt;
+}
+const balanceOf = (token, who) => pc.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [who] });
+const allowance = (token, owner, spender) => pc.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [owner, spender] });
+
+// Builds the extra steps a trade needs: wrap ETH→WETH for the shortfall, exact-amount approvals.
+async function prepSteps({ approvals = [], wethNeeded = 0n }) {
+  const steps = [];
+  if (wethNeeded > 0n) {
+    const wbal = await balanceOf(WETH, W.address);
+    if (wbal < wethNeeded) {
+      const diff = wethNeeded - wbal;
+      const ethBal = await pc.getBalance({ address: W.address });
+      if (ethBal < diff) throw new Error(`Not enough ETH: need ${formatUnits(diff, 18)} more ETH to wrap (plus gas).`);
+      steps.push({ label: `Wrap ${fmtUnits(diff, 18, 6).replace(/<[^>]+>/g, "")} ETH → WETH`, run: () => sendTx({ to: WETH, data: encodeFunctionData({ abi: wethAbi, functionName: "deposit" }), value: diff }, "Wrap ETH") });
+    }
+  }
+  for (const a of approvals) {
+    const cur = await allowance(a.token, W.address, a.spender);
+    if (cur < a.amount) {
+      steps.push({ label: `Approve exact amount`, run: () => sendTx({ to: a.token, data: encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [a.spender, a.amount] }) }, "Approval") });
+    }
+  }
+  return steps;
+}
+
+/* ───────────────────────────── launch discovery ───────────────────────────── */
+let launchCache = { at: 0, list: [] };
+
+function decodeLaunchLog(l) {
+  const ev = decodeEventLog({ abi: A.ammoraLaunchFactoryV4Abi, data: l.data, topics: l.topics.filter(Boolean) });
+  return {
+    token: getAddress(ev.args.token), curve: getAddress(ev.args.curve), creator: getAddress(ev.args.creator),
+    configId: ev.args.configId, configHash: ev.args.configHash, metadataURI: ev.args.metadataURI,
+    block: Number(l.blockNumber), time: l.timeStamp ? Number(l.timeStamp) : null, tx: l.transactionHash,
+  };
+}
+// GIWA's Blockscout indexes the factory's LaunchCreated events (fast, full history).
+async function explorerLogs(params) {
+  const out = [];
+  let from = params.fromBlock ?? FACTORY_START;
+  for (let page = 0; page < 6; page++) {
+    const q = new URLSearchParams({ module: "logs", action: "getLogs", fromBlock: String(from), toBlock: String(params.toBlock ?? "latest"), address: params.address, topic0: params.topic0 });
+    if (params.topic2) { q.set("topic2", params.topic2); q.set("topic0_2_opr", "and"); }
+    const c = new AbortController(); const t = setTimeout(() => c.abort(), 30000);
+    const j = await fetch(`${EXPLORER}/api?${q}`, { signal: c.signal }).then((r) => r.json()).finally(() => clearTimeout(t));
+    const res = Array.isArray(j.result) ? j.result : [];
+    out.push(...res);
+    if (res.length < 1000) break;
+    from = Number(res[res.length - 1].blockNumber) + 1;
+  }
+  return out;
+}
+// Fallback: scan recent blocks directly over RPC (the public RPC limits ranges to 10k blocks).
+async function rpcRecentLaunches(windows = 12) {
+  const head = await pc.getBlockNumber();
+  const out = [];
+  for (let i = 0; i < windows; i++) {
+    const to = head - BigInt(i * 10000);
+    const from = to - 9999n;
+    if (to < FACTORY_START) break;
+    const logs = await pc.getLogs({ address: L.factory, event: LAUNCH_EVENT, fromBlock: from, toBlock: to });
+    out.push(...logs.map((l) => ({ ...l, timeStamp: null })));
+  }
+  return out;
+}
+function localLaunches() {
+  try { return JSON.parse(localStorage.getItem("moralume.created") || "[]"); } catch { return []; }
+}
+function rememberLaunch(x) {
+  const list = localLaunches().filter((y) => y.curve !== x.curve);
+  list.unshift(x);
+  try { localStorage.setItem("moralume.created", bnJson(list.slice(0, 100))); } catch {}
+}
+
+// Decoded launches are cached in localStorage; later visits only fetch blocks after the cache.
+const LOG_CACHE = "moralume.launchLogs.v1";
+function readLogCache() {
+  try { const c = JSON.parse(localStorage.getItem(LOG_CACHE) || "null"); if (c?.factory === L.factory) return c; } catch {}
+  return { factory: L.factory, last: FACTORY_START - 1, items: [] };
+}
+async function fetchNewLaunchLogs() {
+  const cache = readLogCache();
+  const head = Number(await pc.getBlockNumber());
+  const from = cache.last + 1;
+  const ranges = [];
+  for (let s = from; s <= head; s += 1_500_000) ranges.push([s, Math.min(head, s + 1_499_999)]);
+  const settled = await Promise.allSettled(ranges.map(([a, b]) => explorerLogs({ address: L.factory, topic0: LAUNCH_TOPIC, fromBlock: a, toBlock: b })));
+  const fresh = [];
+  let ok = true;
+  settled.forEach((r) => { if (r.status === "fulfilled") fresh.push(...r.value); else ok = false; });
+  if (!ok && cache.items.length === 0 && fresh.length === 0) {
+    try { fresh.push(...await rpcRecentLaunches()); } catch {}
+  }
+  const items = [...cache.items];
+  for (const l of fresh) { try { const x = decodeLaunchLog(l); items.push({ ...x, configId: String(x.configId) }); } catch {} }
+  if (ok) { try { localStorage.setItem(LOG_CACHE, JSON.stringify({ factory: L.factory, last: head, items })); } catch {} }
+  return items.map((x) => ({ ...x, configId: BigInt(x.configId) }));
+}
+
+// Several parts of the page (ticker, explore, swap) may ask at once: share one request.
+let launchesInflight = null;
+function loadLaunches(force = false) {
+  if (!force && Date.now() - launchCache.at < 30_000 && launchCache.list.length) return Promise.resolve(launchCache.list);
+  if (launchesInflight && !force) return launchesInflight;
+  const p = loadLaunchesNow().finally(() => { if (launchesInflight === p) launchesInflight = null; });
+  launchesInflight = p;
+  return p;
+}
+async function loadLaunchesNow() {
+  const byCurve = new Map();
+  for (const x of await fetchNewLaunchLogs()) byCurve.set(x.curve, x);
+  for (const x of localLaunches()) if (!byCurve.has(x.curve)) byCurve.set(x.curve, { ...x, configId: BigInt(x.configId) });
+  const list = [...byCurve.values()].sort((a, b) => b.block - a.block);
+  await enrich(list);
+  launchCache = { at: Date.now(), list };
+  return list;
+}
+
+// One multicall batch reads every curve + token (status, price, reserves, names).
+async function enrich(list) {
+  const fnsCurve = ["status", "sqrtPrice", "quoteReserve", "migrationQuoteThreshold", "canonicalPool"];
+  const fnsTok = ["name", "symbol", "decimals", "totalSupply"];
+  const contracts = list.flatMap((x) => [
+    ...fnsCurve.map((functionName) => ({ address: x.curve, abi: A.ammoraLaunchPoolV4Abi, functionName })),
+    ...fnsTok.map((functionName) => ({ address: x.token, abi: erc20Abi, functionName })),
+  ]);
+  const per = fnsCurve.length + fnsTok.length;
+  // Keep each multicall small: the public RPC rejects very large eth_call payloads.
+  const chunks = [];
+  for (let i = 0; i < contracts.length; i += 250) chunks.push(contracts.slice(i, i + 250));
+  const results = (await Promise.all(chunks.map((c) => pc.multicall({ contracts: c, allowFailure: true })))).flat();
+  list.forEach((x, i) => {
+    const r = results.slice(i * per, (i + 1) * per).map((y) => (y.status === "success" ? y.result : undefined));
+    [x.status, x.sqrtPrice, x.quoteReserve, x.threshold, x.pool, x.name, x.symbol, x.decimals, x.supply] = r;
+    x.decimals = Number(x.decimals ?? 9);
+    x.price = x.sqrtPrice ? sqrtToPrice(x.sqrtPrice, x.decimals) : 0;
+    x.mcap = x.supply ? x.price * Number(formatUnits(x.supply, x.decimals)) : 0;
+    x.progress = x.status >= 2 ? 1 : x.threshold ? Math.min(1, Number(x.quoteReserve ?? 0n) / Number(x.threshold)) : 0;
+  });
+  // Graduated tokens trade in their ARL pool: price and market cap come from the pool, not the frozen curve.
+  const grads = list.filter((x) => x.status === 3 && x.pool && x.pool !== zeroAddress);
+  if (grads.length) {
+    const res = [];
+    for (let i = 0; i < grads.length; i += 250) res.push(...await pc.multicall({ contracts: grads.slice(i, i + 250).map((x) => ({ address: x.pool, abi: A.ammConcentratedPoolV3Abi, functionName: "sqrtPrice" })), allowFailure: true }));
+    grads.forEach((x, i) => {
+      if (res[i]?.status !== "success") return;
+      x.price = sqrtToPrice(res[i].result, x.decimals);
+      x.mcap = x.supply ? x.price * Number(formatUnits(x.supply, x.decimals)) : 0;
+    });
+  }
+  await Promise.all(list.map(async (x) => {
+    if (x.metadataURI?.startsWith("data:")) x.meta = await readMetadata(x.metadataURI);
+  }));
+}
+
+// ETH → USD for market caps. Testnet ETH has no value of its own, so values use the real ETH price
+// as a reference. Two public, key-less price endpoints (allowed in the CSP); falls back to ETH if both fail.
+const PRICE_KEY = "moralume.ethusd";
+let ethUsd = (() => { try { const c = JSON.parse(localStorage.getItem(PRICE_KEY) || "null"); return c && Date.now() - c.at < 6 * 3600e3 ? c.usd : 0; } catch { return 0; } })();
+async function fetchEthUsd() {
+  const tries = [
+    async () => Number((await (await fetch("https://api.coinbase.com/v2/prices/ETH-USD/spot")).json())?.data?.amount),
+    async () => Number((await (await fetch("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd")).json())?.ethereum?.usd),
+  ];
+  for (const t of tries) {
+    try { const v = await t(); if (v > 0 && v < 1e6) return v; } catch {}
+  }
+  return 0;
+}
+const usdCompact = (v) => {
+  if (!(v > 0)) return "$0";
+  if (v >= 1e9) return `$${(v / 1e9).toFixed(2)}B`;
+  if (v >= 1e6) return `$${(v / 1e6).toFixed(2)}M`;
+  if (v >= 1e3) return `$${(v / 1e3).toFixed(v >= 1e5 ? 0 : 1)}K`;
+  if (v >= 1) return `$${v.toFixed(2)}`;
+  return `$${v.toPrecision(2)}`;
+};
+// Market cap (or any ETH value) as dollars when the price is known, otherwise in ETH.
+const mc = (eth, digits) => ethUsd ? usdCompact((eth || 0) * ethUsd) : `${fmtNum(eth || 0, digits)} ETH`;
+async function refreshEthUsd() {
+  const had = ethUsd, v = await fetchEthUsd();
+  if (!v) return;
+  ethUsd = v;
+  try { localStorage.setItem(PRICE_KEY, JSON.stringify({ usd: v, at: Date.now() })); } catch {}
+  if (!had) { if (launchCache.list.length) renderTicker(launchCache.list); render(); } // first price: redraw values
+}
+
+// Progress text that never rounds up to 100% while a tiny amount is still missing.
+const pct = (p, d = 1) => { const f = 10 ** d; let v = Math.floor(Math.min(1, Math.max(0, p)) * 100 * f) / f; if (p < 1 && v >= 100) v = 100 - 1 / f; return v.toFixed(d); };
+const statusBadge = (s) => s === 1 ? `<span class="badge b-live">Live</span>`
+  : s === 2 ? `<span class="badge b-ready">Graduating</span>`
+  : s === 3 ? `<span class="badge b-grad">Graduated</span>` : `<span class="badge b-off">Inactive</span>`;
+const avatar = (x, cls = "") => {
+  const img = safeImg(x.meta?.image);
+  const letter = (String(x.symbol || x.meta?.symbol || "?").slice(0, 1).toUpperCase().match(/[A-Z0-9]/) || ["?"])[0];
+  return img ? `<img class="avatar ${cls}" src="${esc(img)}" alt="" loading="lazy" data-letter="${letter}">`
+    : `<div class="avatar ${cls}">${letter}</div>`;
+};
+// Broken avatar images fall back to the letter badge (no inline onerror handlers, so the CSP stays strict).
+document.addEventListener("error", (e) => {
+  const t = e.target;
+  if (t instanceof HTMLImageElement && t.classList.contains("avatar")) {
+    const d = document.createElement("div");
+    d.className = t.className;
+    d.textContent = t.dataset.letter || "?";
+    t.replaceWith(d);
+  }
+}, true);
+
+/* ───────────────────────────── views: explore ───────────────────────────── */
+const ui = { tab: "site", q: "", board: "new" };
+// Explore view ("board": three columns like a trading board, "grid": cards) and quick-buy amount, remembered per visitor.
+const pref = (k, d) => { try { return localStorage.getItem("moralume." + k) ?? d; } catch { return d; } };
+const setPref = (k, v) => { try { localStorage.setItem("moralume." + k, v); } catch {} };
+ui.view = pref("view", "board");
+ui.quick = pref("quick", "0.01");
+let renderId = 0;
+
+async function viewExplore(id) {
+  app.innerHTML = `
+  <div class="toolbar">
+    <div class="tabs" id="tabs"></div>
+    <input class="search" id="q" placeholder="Search name, symbol or address" value="${esc(ui.q)}" />
+    <label class="qbuy" title="Amount spent by the quick-buy buttons"><span>Quick buy</span><input id="qamt" inputmode="decimal" value="${esc(ui.quick)}"/><span>ETH</span></label>
+    <div class="viewsw" id="viewsw"><button data-v="board" class="${ui.view === "board" ? "on" : ""}" title="Board view">Board</button><button data-v="grid" class="${ui.view === "grid" ? "on" : ""}" title="Card view">Cards</button></div>
+    <button class="btn ghost small" id="refresh">Refresh</button>
+  </div>
+  <div class="grid" id="grid">${Array.from({ length: 6 }, () => `<div class="card lcard"><div class="skel" style="height:48px"></div><div class="skel" style="height:34px"></div><div class="skel" style="height:8px"></div></div>`).join("")}</div>`;
+
+  let list = [];
+  const TABS_GRID = [["site", "This launchpad"], ["all", "All Ammora"], ["live", "Live"], ["ready", "Graduating"], ["grad", "Graduated"], ["mine", "Mine"]];
+  const TABS_BOARD = [["site", "This launchpad"], ["all", "All Ammora"], ["mine", "Mine"]];
+  const drawTabs = () => {
+    const tabs = ui.view === "board" ? TABS_BOARD : TABS_GRID;
+    if (!tabs.some(([k]) => k === ui.tab)) ui.tab = "site";
+    $("#tabs").innerHTML = tabs.map(([k, t]) => `<button data-k="${k}" class="${ui.tab === k ? "on" : ""}">${t}</button>`).join("");
+    document.querySelectorAll("#tabs button").forEach((b) => (b.onclick = () => { ui.tab = b.dataset.k; drawTabs(); draw(); }));
+  };
+  // Board row: compact line with a quick-buy button.
+  const boardRow = (x) => {
+    const live = x.status === 1, ready = x.status === 2, grad = x.status === 3;
+    const action = ready ? `<a class="qbtn alt" href="#/token/${x.curve}">Migrate</a>`
+      : `<button class="qbtn" data-buy="${x.curve}" title="Buy ${esc(ui.quick)} ETH of $${esc(x.symbol || "")}">⚡ ${esc(ui.quick)}</button>`;
+    return `<a class="brow" href="#/token/${x.curve}">
+      ${avatar(x)}
+      <div class="bmain">
+        <div class="btop"><b class="bname">${esc(x.name || x.meta?.name || "Unnamed")}</b><span class="muted bsym">$${esc(x.symbol || x.meta?.symbol || "")}</span>${officialBadge(x)}${shieldBadge(x.configId)}</div>
+        <div class="bmeta"><span>${x.time ? timeAgo(x.time) : `block ${x.block}`}</span><span>·</span><span>MC <b>${mc(x.mcap)}</b></span>${!grad ? `<span>·</span><span>${pct(x.progress, 1)}%</span>` : ""}</div>
+        ${!grad ? `<div class="bar thin"><i style="width:${(x.progress * 100).toFixed(1)}%"></i></div>` : ""}
+      </div>
+      ${action}
+    </a>`;
+  };
+  const drawBoard = (rows) => {
+    const fresh = rows.filter((x) => x.status === 1 && x.progress < 0.5).sort((a, b) => (b.time || b.block || 0) - (a.time || a.block || 0));
+    const soon = rows.filter((x) => (x.status === 1 && x.progress >= 0.5) || x.status === 2).sort((a, b) => (b.status === 2) - (a.status === 2) || b.progress - a.progress);
+    const done = rows.filter((x) => x.status === 3).sort((a, b) => isOfficial(b) - isOfficial(a) || (b.mcap || 0) - (a.mcap || 0));
+    const col = (key, title, items, empty) => `<section class="bcol ${ui.board === key ? "on" : ""}" data-col="${key}">
+      <div class="bhead"><span class="bdot ${key}"></span><b>${title}</b><span class="muted">${items.length}</span></div>
+      <div class="blist">${items.length ? items.slice(0, 40).map(boardRow).join("") : `<div class="bempty">${empty}</div>`}</div></section>`;
+    $("#grid").className = "board";
+    $("#grid").innerHTML = `<div class="bswitch">${[["new", "New", fresh.length], ["soon", "About to graduate", soon.length], ["done", "Graduated", done.length]].map(([k, t, n]) => `<button data-b="${k}" class="${ui.board === k ? "on" : ""}">${t} <span>${n}</span></button>`).join("")}</div>
+      ${col("new", "Newly created", fresh, "No new tokens right now.")}
+      ${col("soon", "About to graduate", soon, "Nothing close to graduating yet.")}
+      ${col("done", "Graduated", done, "No graduated tokens yet.")}`;
+    document.querySelectorAll(".bswitch button").forEach((b) => (b.onclick = () => { ui.board = b.dataset.b; draw(); }));
+  };
+  const draw = () => {
+    if (id !== renderId) return;
+    const q = ui.q.trim().toLowerCase();
+    let rows = list.filter((x) => x.status !== undefined && !isHidden(x.token, x.curve));
+    if (ui.tab === "site") rows = rows.filter((x) => isSiteConfig(x.configId));
+    if (ui.tab === "live") rows = rows.filter((x) => x.status === 1);
+    if (ui.tab === "ready") rows = rows.filter((x) => x.status === 2);
+    if (ui.tab === "grad") rows = rows.filter((x) => x.status === 3);
+    if (ui.tab === "mine") rows = W.address ? rows.filter((x) => x.creator === W.address) : [];
+    if (q) rows = rows.filter((x) => [x.name, x.symbol, x.token, x.curve, x.meta?.name].some((s) => String(s || "").toLowerCase().includes(q)));
+    const g = $("#grid");
+    if (ui.view === "board" && (rows.length || ui.tab !== "mine" || W.address)) { drawBoard(rows); return; }
+    g.className = "grid";
+    if (!rows.length) {
+      g.innerHTML = `<div class="empty">${ui.tab === "site" ? `No tokens on this launchpad yet. <a href="#/create">Launch the first one →</a>` : ui.tab === "mine" && !W.address ? "Connect your wallet to see your launches." : "Nothing here yet."}</div>`;
+      return;
+    }
+    rows = [...rows.filter(isOfficial), ...rows.filter((x) => !isOfficial(x))];
+    g.innerHTML = rows.slice(0, 120).map((x) => `
+      <a class="card lcard" href="#/token/${x.curve}">
+        <div class="lhead">${avatar(x)}
+          <div style="min-width:0;flex:1"><div class="lname">${esc(x.name || x.meta?.name || "Unnamed")}</div><div class="lsym">$${esc(x.symbol || x.meta?.symbol || "")} ${officialBadge(x)}</div></div>
+          <div style="display:grid;gap:4px;justify-items:end">${statusBadge(x.status)}${isSiteConfig(x.configId) ? `<span class="badge b-site">${esc(SITE.name)}</span>` : ""}${shieldBadge(x.configId)}</div>
+        </div>
+        <div class="ldesc">${esc(x.meta?.description || `Created by ${short(x.creator)} · Config #${x.configId}`)}</div>
+        <div class="row"><span class="muted">Market cap</span><b>${mc(x.mcap)}</b></div>
+        <div><div class="row" style="margin-bottom:6px"><span class="muted">Bonding curve</span><b>${pct(x.progress, 1)}%</b></div><div class="bar"><i style="width:${(x.progress * 100).toFixed(1)}%"></i></div></div>
+        <div class="row muted"><span>${x.time ? timeAgo(x.time) : `block ${x.block}`}</span><span>by ${short(x.creator)}</span></div>
+      </a>`).join("");
+  };
+  const bind = () => {
+    drawTabs();
+    $("#q").oninput = (e) => { ui.q = e.target.value; draw(); };
+    $("#qamt").onchange = (e) => {
+      const v = e.target.value.trim();
+      try { if (parseUnits(v, 18) <= 0n) throw 0; ui.quick = v; setPref("quick", v); } catch { e.target.value = ui.quick; toast("Enter a valid ETH amount for quick buy.", "err"); }
+      draw();
+    };
+    document.querySelectorAll("#viewsw button").forEach((b) => (b.onclick = () => {
+      ui.view = b.dataset.v; setPref("view", ui.view);
+      document.querySelectorAll("#viewsw button").forEach((y) => y.classList.toggle("on", y === b));
+      $(".qbuy").hidden = ui.view !== "board";
+      drawTabs(); draw();
+    }));
+    $(".qbuy").hidden = ui.view !== "board";
+    // Quick buy: one click, then confirm in the wallet. Uses the same trade engine as the token page.
+    $("#grid").addEventListener("click", async (e) => {
+      const b = e.target.closest("[data-buy]");
+      if (!b) return;
+      e.preventDefault(); e.stopPropagation();
+      if (b.disabled) return;
+      const curve = b.dataset.buy, label = b.textContent;
+      let inModal = false;
+      b.disabled = true; b.textContent = "…";
+      try {
+        await ensureWallet();
+        const amt = parseUnits(ui.quick, 18);
+        const ctx = await loadTradeCtx(curve), eng = engineFor(ctx);
+        if (!eng) throw new Error("This token is not tradable right now.");
+        const q = await eng.quote("buy", amt, swapState.slip);
+        const steps = await eng.buildSteps("buy", amt, swapState.slip);
+        inModal = true; // from here on, errors are shown inside the step modal
+        await stepModal(`Quick buy ${ctx.tok.symbol}`, steps).run();
+        tradeCtxCache.delete(curve);
+        toast(`Bought ~${fmtUnits(q.amountOut, ctx.tok.decimals)} ${esc(ctx.tok.symbol)} ✓`, "ok");
+      } catch (err) {
+        if (!inModal && err?.message !== "No wallet" && !err?.cancelled) toast(esc(errText(err)), "err");
+      } finally { b.disabled = false; b.textContent = label; }
+    });
+    $("#refresh").onclick = async () => { $("#refresh").disabled = true; try { list = await loadLaunches(true); stats(); draw(); } finally { $("#refresh").disabled = false; } };
+  };
+  // Summary stats were removed from Explore (the page shows only tokens); kept for reuse elsewhere.
+  const stats = () => {
+    if (id !== renderId || !$("#stats")) return;
+    const visible = list.filter((x) => !isHidden(x.token, x.curve));
+    const live = visible.filter((x) => x.status === 1).length;
+    const grad = visible.filter((x) => x.status === 3).length;
+    const tvl = visible.filter((x) => x.status === 1).reduce((s, x) => s + Number(formatUnits(x.quoteReserve ?? 0n, 18)), 0);
+    const site = list.filter((x) => isSiteConfig(x.configId)).length;
+    $("#stats").innerHTML = [["Ammora launches", visible.length], ["Live curves", live], ["Graduated", grad], ["WETH in curves", fmtNum(tvl)], ["On " + SITE.name, site]]
+      .slice(0, 4).map(([k, v]) => `<div class="stat"><div class="k">${esc(k)}</div><div class="v">${v}</div></div>`).join("");
+  };
+  bind();
+  try {
+    list = await loadLaunches();
+    if (ui.tab === "site" && !list.some((x) => isSiteConfig(x.configId))) ui.tab = "all";
+    if (id !== renderId) return;
+    drawTabs();
+    stats(); draw();
+  } catch (e) {
+    if (id === renderId) $("#grid").innerHTML = `<div class="empty">Could not load launches: ${esc(errText(e))}</div>`;
+  }
+}
+
+/* ───────────────────────────── views: token page ───────────────────────────── */
+// AmmoraSwapClient (the multi-venue swap router) is most of the SDK's code but is only needed for
+// graduated tokens, so it is built as a separate file that is loaded on demand (and prefetched when idle).
+// SWAP_MODULE is filled in by build.mjs with the hashed file name.
+const SWAP_MODULE = typeof __SWAP_MODULE__ === "string" ? __SWAP_MODULE__ : "./swap-client.js";
+let swapClientPromise = null, swapModulePromise = null;
+const loadSwapModule = () => (swapModulePromise ??= import(SWAP_MODULE).catch((e) => { swapModulePromise = null; throw e; }));
+const swapClient = () => (swapClientPromise ??= loadSwapModule()
+  .then((m) => m.createSwapClient({ chain, rpc: RPC }))
+  .catch((e) => { swapClientPromise = null; throw e; }));
+
+async function launchInfo(curve) {
+  const cached = launchCache.list.find((x) => x.curve === curve);
+  if (cached) return cached;
+  const local = localLaunches().find((x) => x.curve === curve);
+  if (local) return { ...local, configId: BigInt(local.configId) };
+  try {
+    const logs = await explorerLogs({ address: L.factory, topic0: LAUNCH_TOPIC, topic2: "0x" + curve.slice(2).toLowerCase().padStart(64, "0") });
+    if (logs[0]) return decodeLaunchLog(logs[0]);
+  } catch {}
+  return null;
+}
+
+async function viewToken(id, curveParam) {
+  if (!isAddress(curveParam)) { app.innerHTML = `<div class="empty">Invalid curve address.</div>`; return; }
+  const curve = getAddress(curveParam);
+  app.innerHTML = `<div class="tpage"><div class="card panel"><div class="skel" style="height:72px"></div><div class="skel" style="height:220px;margin-top:16px"></div></div><div class="card trade"><div class="skel" style="height:300px"></div></div></div>`;
+  const cc = new A.AmmoraV4LaunchCurveClient(pc, curve, CORE);
+  let st, info, tok, meta = {}, trades = [], cfgEntry = null;
+  try {
+    let bn;
+    // A freshly created curve can take a few seconds to appear on lagging RPC replicas.
+    for (let i = 0; ; i++) {
+      bn = await pc.getBlockNumber();
+      try { [st, info] = await Promise.all([cc.getStateAtBlock(bn), launchInfo(curve)]); break; }
+      catch (e) { if (i >= 4) throw e; await sleep(2500); }
+    }
+    // Authenticate: the curve must be registered by the reviewed V4 factory for this base token.
+    const factoryToken = await pc.readContract({ address: L.factory, abi: A.ammoraLaunchFactoryV4Abi, functionName: "tokenForCurve", args: [curve] });
+    if (factoryToken === zeroAddress || factoryToken.toLowerCase() !== st.baseToken.toLowerCase()) throw new Error("This address is not a curve created by the Ammora V4 launch factory.");
+    const [name, symbol, decimals, supply] = await Promise.all(["name", "symbol", "decimals", "totalSupply"].map((functionName) => pc.readContract({ address: st.baseToken, abi: erc20Abi, functionName })));
+    tok = { name, symbol, decimals: Number(decimals), supply };
+    meta = info?.metadataURI ? await readMetadata(info.metadataURI) : {};
+    try { cfgEntry = await A.getAmmoraV4ConfigAtBlock(pc, L.configRegistry, st.configId, bn); } catch {}
+  } catch (e) {
+    if (id === renderId) app.innerHTML = `<div class="formcard card"><h2>Launch not found</h2><div class="alert err">${esc(errText(e))}</div><a class="btn ghost" href="#/">← Back to explore</a></div>`;
+    return;
+  }
+  if (id !== renderId) return;
+  if (isHidden(curve, st.baseToken)) {
+    app.innerHTML = `<div class="formcard card"><h2>Token unavailable</h2><div class="alert warn">This token has been hidden on ${esc(SITE.name)}.</div><a class="btn ghost" href="#/">← Back to explore</a></div>`;
+    return;
+  }
+  const pool = st.status === 3 && st.canonicalPool !== zeroAddress ? st.canonicalPool : null;
+  let poolSqrt = null;
+  try {
+    const logs = await explorerLogs({ address: curve, topic0: SWAP_TOPIC, fromBlock: info?.block ?? FACTORY_START });
+    trades = logs.map((l) => {
+      const ev = decodeEventLog({ abi: A.ammoraLaunchPoolV4Abi, data: l.data, topics: l.topics.filter(Boolean) });
+      return { ...ev.args, venue: "Curve", time: Number(l.timeStamp), tx: l.transactionHash, block: Number(l.blockNumber), logIndex: Number(l.logIndex || 0) };
+    });
+  } catch {}
+  if (pool) {
+    // Post-graduation trades: Swap / SwapPartialFill events of the ARL pool, in the same shape as curve trades.
+    try {
+      poolSqrt = await pc.readContract({ address: pool, abi: A.ammConcentratedPoolV3Abi, functionName: "sqrtPrice" });
+      const fromBlock = trades.length ? trades[trades.length - 1].block : (info?.block ?? FACTORY_START);
+      const sets = await Promise.all(POOL_SWAP_TOPICS.map((topic0) => explorerLogs({ address: pool, topic0, fromBlock }).catch(() => [])));
+      for (const l of sets.flat()) {
+        try {
+          const ev = decodeEventLog({ abi: POOL_SWAP_EVENTS, data: l.data, topics: l.topics.filter(Boolean) });
+          const a = ev.args;
+          trades.push({ venue: "Pool", baseForQuote: a.tokenIn.toLowerCase() !== WETH.toLowerCase(), amountIn: a.amountIn, amountOut: a.amountOut,
+            trader: a.recipient, nextSqrtPrice: a.sqrtPrice, time: Number(l.timeStamp), tx: l.transactionHash, block: Number(l.blockNumber), logIndex: Number(l.logIndex || 0) });
+        } catch {}
+      }
+      trades.sort((p, q) => p.block - q.block || p.logIndex - q.logIndex);
+    } catch {}
+  }
+  if (id !== renderId) return;
+
+  const dec = tok.decimals;
+  const price = sqrtToPrice(poolSqrt ?? st.sqrtPrice, dec);
+  const mcap = price * Number(formatUnits(tok.supply, dec));
+  const progress = st.status >= 2 ? 1 : Number(st.quoteReserve) / Number(st.migrationQuoteThreshold || 1n);
+  const links = [["Website", meta.website], ["X", meta.twitter], ["Telegram", meta.telegram]].filter(([, u]) => safeUrl(u));
+  const x = { meta, symbol: tok.symbol };
+
+  app.innerHTML = `
+  <div style="margin-top:18px"><a href="#/" class="muted">← All launches</a></div>
+  <div class="tpage" style="margin-top:12px">
+    <div>
+      <div class="card panel">
+        <div class="thead">${avatar(x, "lg")}
+          <div style="flex:1;min-width:0"><h2>${esc(tok.name)} <span class="muted" style="font-size:18px">$${esc(tok.symbol)}</span> ${officialBadge({ token: st.baseToken, curve, creator: info?.creator || st.creator })}</h2>
+          <div style="display:flex;gap:6px;align-items:center;margin-top:4px;flex-wrap:wrap">${statusBadge(st.status)}${isSiteConfig(st.configId) ? `<span class="badge b-site">${esc(SITE.name)}</span>` : ""}${shieldBadge(st.configId)}<span class="muted" style="font-size:13px">Config #${st.configId} · fee ${(st.currentFeeBps / 100).toFixed(2)}%</span></div></div>
+        </div>
+        ${meta.description ? `<p class="ink2" style="margin:14px 0 0;white-space:pre-wrap">${esc(meta.description)}</p>` : ""}
+        ${links.length ? `<div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">${links.map(([t, u]) => `<a class="btn ghost small" href="${esc(safeUrl(u))}" target="_blank" rel="noopener noreferrer nofollow">${t} ↗</a>`).join("")}</div>` : ""}
+        <div class="kv">
+          <div><div class="k">Price</div><div class="v">${fmtNum(price)} ETH</div></div>
+          <div><div class="k">Market cap</div><div class="v" title="${fmtNum(mcap)} ETH">${mc(mcap)}</div></div>
+          ${pool ? `<div><div class="k">Trading in</div><div class="v"><a href="${addrUrl(pool)}" target="_blank" rel="noopener">ARL pool ↗</a></div></div>`
+            : `<div><div class="k">Curve reserve</div><div class="v">${fmtUnits(st.quoteReserve, 18)} WETH</div></div>`}
+          <div><div class="k">Trades</div><div class="v">${trades.length}</div></div>
+        </div>
+        <div style="margin-top:16px">
+          <div class="row" style="margin-bottom:6px"><span class="muted">Bonding curve progress — graduates at ${fmtUnits(st.migrationQuoteThreshold, 18)} WETH</span><b>${pct(progress, 2)}%</b></div>
+          <div class="bar" style="height:12px"><i style="width:${(Math.min(1, progress) * 100).toFixed(2)}%"></i></div>
+        </div>
+        ${st.status === 1 && progress >= 0.99 && st.quoteReserve < st.migrationQuoteThreshold ? `<div class="alert info" style="margin-top:12px">Almost full: only <b>${fmtUnits(st.migrationQuoteThreshold - st.quoteReserve, 18)} WETH</b> is left. The next buy completes the curve, then anyone can migrate it to the ARL pool.</div>` : ""}
+        ${st.status === 2 ? `<div class="alert info" style="margin-top:12px">The curve is full. It becomes <b>Graduated</b> once someone sends the one-click <b>Migrate</b> transaction (gas only, anyone can do it).</div>` : ""}
+        ${presetFor(st.configId)?.antiSniper && st.status === 1 && st.currentFeeBps > 100 ? `<div class="alert warn" style="margin-top:12px">Anti-sniper launch: the trading fee is <b>${(st.currentFeeBps / 100).toFixed(0)}%</b> right now and drops 1% every 15 seconds until it reaches 1%. Refresh to see the current fee.</div>` : ""}
+        <svg class="chart" id="chart" viewBox="0 0 700 220" preserveAspectRatio="none"></svg>
+        <div class="addr">
+          <div><span>Token</span> <a class="mono" href="${addrUrl(st.baseToken)}" target="_blank" rel="noopener">${short(st.baseToken)}</a></div>
+          <div><span>Curve</span> <a class="mono" href="${addrUrl(curve)}" target="_blank" rel="noopener">${short(curve)}</a></div>
+          <div><span>Creator</span> <a class="mono" href="${addrUrl(st.creator)}" target="_blank" rel="noopener">${short(st.creator)}</a></div>
+          ${st.canonicalPool !== zeroAddress ? `<div><span>ARL pool</span> <a class="mono" href="${addrUrl(st.canonicalPool)}" target="_blank" rel="noopener">${short(st.canonicalPool)}</a></div>` : ""}
+          <div><span>Partner</span> <a class="mono" href="${addrUrl(st.partnerRecipient)}" target="_blank" rel="noopener">${short(st.partnerRecipient)}</a></div>
+        </div>
+      </div>
+      <div class="card panel" style="margin-top:14px">
+        <div class="sect" style="margin-top:0">${pool ? "Trades" : "Bonding-curve trades"}</div>
+        ${trades.length ? `<div style="overflow:auto"><table><thead><tr><th>Type</th>${pool ? "<th>Venue</th>" : ""}<th>Paid</th><th>Received</th><th>Trader</th><th>When</th></tr></thead><tbody>
+          ${trades.slice(-40).reverse().map((t) => {
+            const sell = t.baseForQuote;
+            return `<tr><td><b class="${sell ? "bad" : "good"}">${sell ? "Sell" : "Buy"}</b></td>${pool ? `<td><span class="badge ${t.venue === "Pool" ? "b-grad" : "b-off"}">${t.venue}</span></td>` : ""}
+              <td>${sell ? fmtUnits(t.amountIn, dec) + " " + esc(tok.symbol) : fmtUnits(t.amountIn, 18) + " WETH"}</td>
+              <td>${sell ? fmtUnits(t.amountOut, 18) + " WETH" : fmtUnits(t.amountOut, dec) + " " + esc(tok.symbol)}</td>
+              <td><a class="mono" href="${addrUrl(t.trader)}" target="_blank" rel="noopener">${short(t.trader)}</a></td>
+              <td><a href="${txUrl(t.tx)}" target="_blank" rel="noopener">${timeAgo(t.time)}</a></td></tr>`;
+          }).join("")}</tbody></table></div>` : `<div class="muted">No curve trades yet — be the first buyer.</div>`}
+      </div>
+    </div>
+    <div class="card trade" id="trade"></div>
+  </div>`;
+  drawChart(trades, dec, cfgEntry);
+  const ctx = { cc, st, tok, curve, cfgEntry, refresh: () => { launchCache.at = 0; setTimeout(render, 2500); } };
+  if (st.status === 1) tradeCurve(ctx);
+  else if (st.status === 2) tradeMigrate(ctx);
+  else if (st.status === 3) tradePool(ctx);
+  else $("#trade").innerHTML = `<div class="alert warn">This curve is not active yet.</div>`;
+}
+
+function drawChart(trades, dec) {
+  const svg = $("#chart");
+  if (!svg) return;
+  const pts = trades.map((t) => ({ t: t.time, p: sqrtToPrice(t.nextSqrtPrice, dec) })).filter((x) => x.p > 0);
+  if (pts.length < 2) {
+    svg.innerHTML = `<text x="350" y="115" text-anchor="middle" fill="#8a90a6" font-size="14">Price chart appears after a couple of trades</text>`;
+    return;
+  }
+  const W_ = 700, H = 220, pad = 14;
+  const ps = pts.map((x) => x.p), min = Math.min(...ps), max = Math.max(...ps);
+  const xs = (i) => pad + (i / (pts.length - 1)) * (W_ - 2 * pad);
+  const ys = (p) => H - pad - ((p - min) / (max - min || 1)) * (H - 2 * pad);
+  const line = pts.map((x, i) => `${i ? "L" : "M"}${xs(i).toFixed(1)},${ys(x.p).toFixed(1)}`).join("");
+  svg.innerHTML = `<defs><linearGradient id="lg" x1="0" x2="1"><stop offset="0" stop-color="#e8836b"/><stop offset="1" stop-color="#f3b88a"/></linearGradient>
+    <linearGradient id="fg" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#e8836b" stop-opacity=".18"/><stop offset="1" stop-color="#e8836b" stop-opacity="0"/></linearGradient></defs>
+    <path d="${line}L${xs(pts.length - 1)},${H - pad}L${pad},${H - pad}Z" fill="url(#fg)"/>
+    <path d="${line}" fill="none" stroke="url(#lg)" stroke-width="2.5" vector-effect="non-scaling-stroke"/>`;
+}
+
+// Shared trade-box shell (buy/sell tabs, amount input, quick buttons, live quote).
+function tradeBox(ctx, { title, quoteFn, execFn, note }) {
+  const box = $("#trade");
+  const st = { side: "buy", slip: SITE.defaultSlippageBps, quote: null, seq: 0 };
+  const sym = ctx.tok.symbol;
+  const draw = () => {
+    const buy = st.side === "buy";
+    box.innerHTML = `
+      <div style="font-weight:800;margin-bottom:10px">${title}</div>
+      <div class="seg"><button class="buy ${buy ? "on" : ""}" data-s="buy">Buy</button><button class="sell ${!buy ? "on" : ""}" data-s="sell">Sell</button></div>
+      <div class="field"><div class="top"><span>You pay</span><span id="bal">${W.address ? "Balance: …" : ""}</span></div>
+        <div class="mid"><input id="amt" inputmode="decimal" placeholder="0.0" autocomplete="off"/><span class="tok">${buy ? "ETH/WETH" : esc(sym)}</span></div></div>
+      <div class="quick">${(buy ? ["0.0001", "0.001", "0.005", "0.01"] : ["25%", "50%", "75%", "100%"]).map((v) => `<button data-v="${v}">${v}</button>`).join("")}</div>
+      <div class="quote" id="qbox"><div class="row"><span class="muted">You receive (est.)</span><b id="qout">—</b></div>
+        <div class="row"><span class="muted">Minimum after <span id="slipLbl">${(st.slip / 100).toFixed(1)}</span>% slippage</span><span id="qmin">—</span></div>
+        <div class="row"><span class="muted">Fee</span><span id="qfee">—</span></div></div>
+      <div id="qnote"></div>
+      <button class="btn block ${buy ? "grad" : ""}" id="go">${W.address ? (buy ? `Buy $${esc(sym)}` : `Sell $${esc(sym)}`) : "Connect wallet"}</button>
+      <div class="note">${note}</div>
+      <div class="row note"><span>Slippage</span><span><select id="slip" class="inp" style="padding:4px 8px;width:auto">${[50, 100, 300, 500, 1000].map((b) => `<option value="${b}" ${b === st.slip ? "selected" : ""}>${b / 100}%</option>`).join("")}</select></span></div>`;
+    box.querySelectorAll(".seg button").forEach((b) => (b.onclick = () => { st.side = b.dataset.s; draw(); }));
+    $("#slip").onchange = (e) => { st.slip = Number(e.target.value); $("#slipLbl").textContent = (st.slip / 100).toFixed(1); requote(); };
+    $("#amt").oninput = () => requote();
+    box.querySelectorAll(".quick button").forEach((b) => (b.onclick = async () => {
+      const v = b.dataset.v;
+      if (v.endsWith("%")) {
+        if (!W.address) return;
+        const bal = await balanceOf(ctx.st.baseToken, W.address);
+        $("#amt").value = formatUnits(bal * BigInt(parseInt(v)) / 100n, ctx.tok.decimals);
+      } else $("#amt").value = v;
+      requote();
+    }));
+    $("#go").onclick = go;
+    showBal();
+    const pre = sessionStorage.getItem("moralume.prefillBuy");
+    if (pre && buy) { sessionStorage.removeItem("moralume.prefillBuy"); $("#amt").value = pre; requote(); }
+  };
+  const showBal = async () => {
+    if (!W.address) return;
+    try {
+      if (st.side === "buy") {
+        const [e, w] = await Promise.all([pc.getBalance({ address: W.address }), balanceOf(WETH, W.address)]);
+        $("#bal").textContent = `${Number(formatUnits(e, 18)).toFixed(5)} ETH · ${Number(formatUnits(w, 18)).toFixed(5)} WETH`;
+      } else {
+        const b = await balanceOf(ctx.st.baseToken, W.address);
+        $("#bal").innerHTML = `Balance: ${fmtUnits(b, ctx.tok.decimals)}`;
+      }
+    } catch {}
+  };
+  const parseAmt = () => {
+    const v = ($("#amt")?.value || "").trim();
+    if (!/^\d*\.?\d+$/.test(v)) return 0n;
+    try { return parseUnits(v, st.side === "buy" ? 18 : ctx.tok.decimals); } catch { return 0n; }
+  };
+  let timer;
+  const requote = () => {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const amt = parseAmt();
+      const my = ++st.seq;
+      st.quote = null;
+      if (!amt) { $("#qout").textContent = "—"; $("#qmin").textContent = "—"; $("#qfee").textContent = "—"; $("#qnote").innerHTML = ""; return; }
+      $("#qout").textContent = "Quoting…";
+      try {
+        const q = await quoteFn(st.side, amt, st.slip);
+        if (my !== st.seq) return;
+        st.quote = q;
+        const outDec = st.side === "buy" ? ctx.tok.decimals : 18, outSym = st.side === "buy" ? sym : "WETH";
+        const feeDec = q.feeIsQuote ?? true ? 18 : ctx.tok.decimals;
+        $("#qout").innerHTML = `${fmtUnits(q.amountOut, outDec)} ${esc(outSym)}`;
+        $("#qmin").innerHTML = `${fmtUnits(q.minOut, outDec)} ${esc(outSym)}`;
+        $("#qfee").innerHTML = `${fmtUnits(q.fee, feeDec)} ${q.feeIsQuote ?? true ? "WETH" : esc(sym)}`;
+        $("#qnote").innerHTML = q.note || "";
+      } catch (e) {
+        if (my !== st.seq) return;
+        $("#qout").textContent = "—";
+        $("#qnote").innerHTML = `<div class="alert err">${esc(errText(e))}</div>`;
+      }
+    }, 350);
+  };
+  async function go() {
+    try {
+      await ensureWallet();
+      if (!$("#amt")) return draw();
+      const amt = parseAmt();
+      if (!amt) throw new Error("Enter an amount.");
+      if (st.side === "sell") {
+        const bal = await balanceOf(ctx.st.baseToken, W.address);
+        if (bal < amt) throw new Error(`Insufficient ${sym} balance.`);
+      }
+      $("#go").disabled = true;
+      await execFn(st.side, amt, st.slip);
+      ctx.refresh();
+    } catch (e) {
+      if (e.message !== "No wallet") toast(esc(errText(e)), "err", 9000);
+    } finally { const g = $("#go"); if (g) g.disabled = false; showBal(); }
+  }
+  draw();
+}
+
+// ── Trade engines ───────────────────────────────────────────────────────────
+// An engine quotes and builds the transaction steps for one token against WETH:
+// "buy" = WETH → token, "sell" = token → WETH. The token page and the Swap page share them.
+
+// Pre-graduation: the Ammora ALC bonding curve.
+function curveEngine(ctx) {
+  const { cc } = ctx;
+  const quote = async (side, amt, slip) => {
+    const baseForQuote = side === "sell";
+    const bn = await pc.getBlockNumber();
+    const q = await cc.quoteExactInputAtBlock(amt, baseForQuote, bn);
+    const fill = A.classifyAmmoraV4ExactInputFill(q, baseForQuote);
+    let note = "";
+    if (fill.kind === "graduation-boundary") note = `<div class="alert info">This buy completes the bonding curve 🎓 Only ${fmtUnits(fill.consumedAmountIn, 18)} WETH is used; the unused ${fmtUnits(fill.refundableAmountIn, 18)} WETH stays in your wallet. After it confirms, anyone can migrate the curve into its ARL pool.</div>`;
+    else if (fill.kind !== "full") throw new Error(baseForQuote ? "This sell cannot be filled in full on the curve. Try a smaller amount." : "This order cannot be filled. Try a smaller amount.");
+    return { amountOut: q.amountOut, minOut: q.amountOut * BigInt(10_000 - slip) / 10_000n, fee: q.fee, feeIsQuote: true, note, fill };
+  };
+  const buildSteps = async (side, amt, slip) => {
+    const baseForQuote = side === "sell";
+    const bn = await pc.getBlockNumber();
+    const q = await cc.quoteExactInputAtBlock(amt, baseForQuote, bn);
+    const fill = A.classifyAmmoraV4ExactInputFill(q, baseForQuote);
+    if (fill.kind !== "full" && fill.kind !== "graduation-boundary") throw new Error(`Order not executable (${fill.kind}).`);
+    if (baseForQuote && fill.kind !== "full") throw new Error("Partial sells are not allowed. Try a smaller amount.");
+    const plan = await cc.planSwapExactInput({
+      includedAmountIn: amt, baseForQuote, allowPartialFill: fill.allowPartialFill, slippageBps: slip,
+      recipient: W.address, deadline: nowSec() + 1200n,
+    });
+    const steps = await prepSteps({ approvals: plan.approvalRequirements, wethNeeded: baseForQuote ? 0n : amt });
+    steps.push({ label: baseForQuote ? `Sell ${ctx.tok.symbol} on the curve` : `Buy ${ctx.tok.symbol} on the curve`, run: async () => {
+      // Re-plan right before signing so minimum output reflects the latest state.
+      const fresh = await cc.planSwapExactInput({ includedAmountIn: amt, baseForQuote, allowPartialFill: fill.allowPartialFill, slippageBps: slip, recipient: W.address, deadline: nowSec() + 1200n });
+      return sendTx(fresh.transaction, baseForQuote ? "Sell" : "Buy");
+    } });
+    return steps;
+  };
+  return { route: "bonding curve", quote, buildSteps };
+}
+
+// Post-graduation: the canonical Ammora ARL pool through AmmoraSwapClient.
+function poolEngine(ctx) {
+  const model = ctx.cfgEntry?.config?.migrationMode === 1 ? "compounding" : "concentrated";
+  const pool = ctx.st.canonicalPool;
+  const prepare = async (side, amt, slip) => {
+    const sw = await swapClient();
+    return sw.prepareExactIn({
+      model, pool, tokenIn: side === "buy" ? WETH : ctx.st.baseToken, inputAsset: "erc20", amountIn: amt,
+      payer: W.address || ctx.st.creator, recipient: W.address || ctx.st.creator, slippageBps: slip, executionMode: "direct-wallet",
+    });
+  };
+  const quote = async (side, amt, slip) => {
+    const p = await prepare(side, amt, slip);
+    const q = p.quote;
+    const impact = q.priceImpactBps != null ? Number(q.priceImpactBps) / 100 : null;
+    return {
+      amountOut: q.expectedAmountOut, minOut: q.minimumAmountOut, fee: q.feeAmount ?? 0n,
+      feeIsQuote: !q.feeToken || q.feeToken.toLowerCase() === WETH.toLowerCase(),
+      note: impact != null && impact > 5 ? `<div class="alert warn">High price impact: ${impact.toFixed(2)}%</div>` : "",
+    };
+  };
+  const buildSteps = async (side, amt, slip) => {
+    const p = await prepare(side, amt, slip);
+    if (p.quote.remainderAmountIn && p.quote.remainderAmountIn > 0n) throw new Error("The pool cannot fill this amount. Try a smaller trade.");
+    const steps = await prepSteps({ approvals: p.approvalRequirements, wethNeeded: side === "buy" ? amt : 0n });
+    steps.push({ label: side === "buy" ? `Buy ${ctx.tok.symbol} in ARL pool` : `Sell ${ctx.tok.symbol} in ARL pool`, run: async () => {
+      const fresh = await prepare(side, amt, slip);
+      return sendTx({ to: fresh.transaction.to, data: fresh.transaction.data, value: fresh.transaction.value ?? 0n }, "Swap");
+    } });
+    return steps;
+  };
+  return { route: `${model} ARL pool`, model, pool, quote, buildSteps };
+}
+
+const engineFor = (ctx) => (ctx.st.status === 1 ? curveEngine(ctx) : ctx.st.status === 3 ? poolEngine(ctx) : null);
+
+function tradeCurve(ctx) {
+  const e = curveEngine(ctx);
+  tradeBox(ctx, {
+    title: "Trade on the bonding curve", quoteFn: e.quote,
+    execFn: async (side, amt, slip) => stepModal(side === "sell" ? "Selling" : "Buying", await e.buildSteps(side, amt, slip)).run(),
+    note: "Buys are paid in WETH; any missing WETH is wrapped from your ETH automatically. Approvals are for the exact amount only.",
+  });
+}
+
+// Curve filled: anyone can trigger migration into the ARL pool.
+function tradeMigrate(ctx) {
+  $("#trade").innerHTML = `
+    <div style="font-weight:800;margin-bottom:10px">Graduation 🎓</div>
+    <div class="alert info">The bonding curve is full. One permissionless transaction migrates its liquidity into a permanent Ammora ARL pool; trading continues there.</div>
+    <button class="btn grad block" id="mig">${W.address ? "Migrate to ARL pool" : "Connect wallet to migrate"}</button>
+    <div class="note">Gas only — no tokens are spent. The SDK checks the curve is authentic and ready before building the transaction.</div>`;
+  $("#mig").onclick = async () => {
+    try {
+      await ensureWallet();
+      $("#mig").disabled = true;
+      await stepModal("Graduating", [{ label: "Migrate curve → ARL pool", run: async () => {
+        const plan = await ctx.cc.planMigrateAtBlock(await pc.getBlockNumber());
+        return sendTx(plan.transaction, "Migration");
+      } }]).run();
+      ctx.refresh();
+    } catch (e) { toast(esc(errText(e)), "err", 9000); $("#mig").disabled = false; }
+  };
+}
+
+function tradePool(ctx) {
+  const e = poolEngine(ctx);
+  tradeBox(ctx, {
+    title: `Trade in the graduated ${e.model} ARL pool`, quoteFn: e.quote,
+    execFn: async (side, amt, slip) => stepModal("Swapping", await e.buildSteps(side, amt, slip)).run(),
+    note: `This token graduated. Trades route through the canonical Ammora ARL pool <a class="mono" href="${addrUrl(e.pool)}" target="_blank" rel="noopener">${short(e.pool)}</a>.`,
+  });
+}
+
+/* ───────────────────────────── views: swap (exchange) ───────────────────────────── */
+// Swap ETH/WETH ⇄ any Ammora launch token, or token ⇄ token routed through WETH.
+// Each leg uses the token's live venue: the bonding curve before graduation, its ARL pool after.
+const ETH_ASSET = { kind: "eth", symbol: "ETH", name: "Ether (auto-wrapped to WETH)", decimals: 18 };
+const swapState = { from: ETH_ASSET, to: null, slip: SITE.defaultSlippageBps };
+const tradeCtxCache = new Map();
+
+async function loadTradeCtx(curve) {
+  if (tradeCtxCache.has(curve) && Date.now() - tradeCtxCache.get(curve).at < 15_000) return tradeCtxCache.get(curve);
+  const cc = new A.AmmoraV4LaunchCurveClient(pc, curve, CORE);
+  const bn = await pc.getBlockNumber();
+  const st = await cc.getStateAtBlock(bn);
+  const factoryToken = await pc.readContract({ address: L.factory, abi: A.ammoraLaunchFactoryV4Abi, functionName: "tokenForCurve", args: [curve] });
+  if (factoryToken === zeroAddress || factoryToken.toLowerCase() !== st.baseToken.toLowerCase()) throw new Error("Not an Ammora V4 launch.");
+  const [name, symbol, decimals] = await Promise.all(["name", "symbol", "decimals"].map((functionName) => pc.readContract({ address: st.baseToken, abi: erc20Abi, functionName })));
+  let cfgEntry = null;
+  if (st.status === 3) { try { cfgEntry = await A.getAmmoraV4ConfigAtBlock(pc, L.configRegistry, st.configId, bn); } catch {} }
+  const ctx = { at: Date.now(), cc, st, curve, cfgEntry, tok: { name, symbol, decimals: Number(decimals) } };
+  tradeCtxCache.set(curve, ctx);
+  return ctx;
+}
+const assetFromLaunch = (x) => ({ kind: "token", curve: x.curve, token: x.token, creator: x.creator, symbol: x.symbol || x.meta?.symbol || "?", name: x.name || x.meta?.name || "Unnamed", decimals: x.decimals ?? 9, meta: x.meta, status: x.status });
+const assetLabel = (a) => a ? (a.kind === "eth" ? `<div class="avatar sm eth">Ξ</div><b>ETH</b>` : `${avatar(a, "sm")}<b>${esc(a.symbol)}</b>`) : `<b>Select token</b>`;
+
+async function viewSwap(id, preselect) {
+  const slipOpts = [50, 100, 300, 500, 1000];
+  app.innerHTML = `
+  <div class="swpage">
+    <div class="swhero"><h2>Swap</h2>
+      <div class="muted">Trade any token launched on Ammora. We pick the right route for you: the bonding curve, or its pool after graduation.</div></div>
+    <div class="swgrid"><div class="swmain">
+    <div class="swpanel">
+      <div class="swtop"><span>You pay</span>
+        <div class="swslip"><button type="button" class="slipchip" id="slipbtn">Slippage <b id="slipval">${swapState.slip / 100}%</b></button>
+          <div class="slipmenu" id="slipmenu" hidden>${slipOpts.map((b) => `<button type="button" data-b="${b}">${b / 100}%</button>`).join("")}</div></div></div>
+      <div class="swmid"><input id="samt" inputmode="decimal" placeholder="0" autocomplete="off"/><button class="assetbtn" id="pickFrom"></button></div>
+      <div class="swbot"><span id="sbalFrom"></span><button type="button" class="maxbtn" id="smax" hidden>Max</button></div>
+    </div>
+    <div class="swflip"><button class="flip" id="flip" title="Switch direction">⇅</button></div>
+    <div class="swpanel">
+      <div class="swtop"><span>You receive</span></div>
+      <div class="swmid"><input id="sout" placeholder="0" readonly tabindex="-1"/><button class="assetbtn" id="pickTo"></button></div>
+      <div class="swbot"><span id="sbalTo"></span></div>
+    </div>
+    <div class="quote" id="squote" style="display:none"></div>
+    <div id="snote"></div>
+    <button class="btn grad block swgo" id="sgo"></button>
+    <div class="swfoot"><span>ETH is wrapped automatically</span><span>·</span><span>Sells pay out WETH</span></div>
+    </div>
+    <aside class="card swpop"><div class="swpop-h"><b>Popular right now</b><span class="muted">on ${esc(SITE.name)}</span></div><div id="swpop"><div class="skel" style="height:120px"></div></div></aside>
+  </div></div>`;
+  // Slippage chip with a small menu.
+  $("#slipbtn").onclick = (e) => { e.stopPropagation(); $("#slipmenu").hidden = !$("#slipmenu").hidden; };
+  document.querySelectorAll("#slipmenu button").forEach((b) => (b.onclick = () => {
+    swapState.slip = Number(b.dataset.b); $("#slipval").textContent = `${swapState.slip / 100}%`; $("#slipmenu").hidden = true; requote();
+  }));
+  document.addEventListener("click", (e) => { const m = $("#slipmenu"); if (m && !e.target.closest(".swslip")) m.hidden = true; });
+  // Show the controls right away; token data fills in once launches are loaded.
+  $("#pickFrom").innerHTML = assetLabel(swapState.from) + " ▾";
+  $("#pickTo").innerHTML = assetLabel(swapState.to) + " ▾";
+  $("#pickTo").classList.toggle("empty", !swapState.to);
+  $("#sgo").textContent = W.address ? "Loading…" : "Connect wallet";
+
+  let list = [];
+  try { list = await loadLaunches(); } catch {}
+  if (id !== renderId) return;
+  const tradable = list.filter((x) => (x.status === 1 || x.status === 3) && !isHidden(x.token, x.curve));
+  if (preselect) {
+    const x = tradable.find((y) => y.curve.toLowerCase() === preselect.toLowerCase() || y.token.toLowerCase() === preselect.toLowerCase());
+    if (x) { swapState.to = assetFromLaunch(x); if (swapState.from.kind !== "eth" && swapState.from.curve === x.curve) swapState.from = ETH_ASSET; }
+  }
+
+  let seq = 0, timer, quoteRes = null;
+  const parseIn = () => {
+    const v = ($("#samt")?.value || "").trim();
+    if (!/^\d*\.?\d+$/.test(v)) return 0n;
+    try { return parseUnits(v, swapState.from.decimals); } catch { return 0n; }
+  };
+  const showBalances = async () => {
+    if (!W.address) { $("#sbalFrom").textContent = ""; $("#sbalTo").textContent = ""; return; }
+    const bal = async (a) => {
+      if (!a) return "";
+      if (a.kind === "eth") {
+        const [e, w] = await Promise.all([pc.getBalance({ address: W.address }), balanceOf(WETH, W.address)]);
+        return `Balance: ${Number(formatUnits(e, 18)).toFixed(5)} ETH${w > 0n ? ` + ${Number(formatUnits(w, 18)).toFixed(5)} WETH` : ""}`;
+      }
+      return `Balance: ${fmtUnits(await balanceOf(a.token, W.address), a.decimals)}`;
+    };
+    try { $("#sbalFrom").innerHTML = await bal(swapState.from); $("#sbalTo").innerHTML = await bal(swapState.to); } catch {}
+    $("#smax").hidden = swapState.from.kind !== "token";
+  };
+  const draw = () => {
+    $("#pickFrom").innerHTML = assetLabel(swapState.from) + " ▾";
+    $("#pickTo").innerHTML = assetLabel(swapState.to) + " ▾";
+    $("#pickTo").classList.toggle("empty", !swapState.to);
+    const g = $("#sgo");
+    g.textContent = !W.address ? "Connect wallet" : !swapState.to ? "Select a token" : "Swap";
+    showBalances();
+    requote();
+  };
+
+  // Quote: one leg (ETH ⇄ token) or two legs (token → WETH → token).
+  const quote = async (amt) => {
+    const { from, to, slip } = swapState;
+    if (from.kind === "eth") {
+      const ctx = await loadTradeCtx(to.curve), e = engineFor(ctx);
+      if (!e) throw new Error(`${to.symbol} is not tradable right now (waiting for migration).`);
+      const q = await e.quote("buy", amt, slip);
+      return { amountOut: q.amountOut, minOut: q.minOut, outDec: ctx.tok.decimals, route: `ETH → ${ctx.tok.symbol} via ${e.route}`, note: q.note, legs: [{ ctx, e, side: "buy" }] };
+    }
+    if (to.kind === "eth") {
+      const ctx = await loadTradeCtx(from.curve), e = engineFor(ctx);
+      if (!e) throw new Error(`${from.symbol} is not tradable right now (waiting for migration).`);
+      const q = await e.quote("sell", amt, slip);
+      return { amountOut: q.amountOut, minOut: q.minOut, outDec: 18, outSym: "WETH", route: `${ctx.tok.symbol} → WETH via ${e.route}`, note: q.note, legs: [{ ctx, e, side: "sell" }] };
+    }
+    const [ca, cb] = await Promise.all([loadTradeCtx(from.curve), loadTradeCtx(to.curve)]);
+    const ea = engineFor(ca), eb = engineFor(cb);
+    if (!ea || !eb) throw new Error("One of these tokens is not tradable right now (waiting for migration).");
+    const q1 = await ea.quote("sell", amt, slip);
+    const q2 = await eb.quote("buy", q1.minOut, slip);         // conservative: second leg priced from leg-1 minimum
+    const q2exp = await eb.quote("buy", q1.amountOut, slip).catch(() => q2);
+    return {
+      amountOut: q2exp.amountOut, minOut: q2.minOut, outDec: cb.tok.decimals,
+      route: `${ca.tok.symbol} → WETH (${ea.route}) → ${cb.tok.symbol} (${eb.route})`,
+      note: [q1.note, q2.note].filter(Boolean).join(""), legs: [{ ctx: ca, e: ea, side: "sell" }, { ctx: cb, e: eb, side: "buy" }],
+    };
+  };
+  function requote() {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const amt = parseIn(), my = ++seq;
+      quoteRes = null;
+      $("#snote").innerHTML = "";
+      if (!amt || !swapState.to) { $("#sout").value = ""; $("#squote").style.display = "none"; return; }
+      $("#sout").value = "Quoting…";
+      try {
+        const q = await quote(amt);
+        if (my !== seq) return;
+        quoteRes = q;
+        $("#sout").value = formatUnits(q.amountOut, q.outDec);
+        const outSym = q.outSym || (swapState.to.kind === "eth" ? "WETH" : swapState.to.symbol);
+        $("#squote").style.display = "grid";
+        $("#squote").innerHTML = `<div class="row"><span class="muted">Minimum received</span><b>${fmtUnits(q.minOut, q.outDec)} ${esc(outSym)}</b></div>
+          <div class="row"><span class="muted">Route</span><span style="text-align:right">${esc(q.route)}</span></div>`;
+        $("#snote").innerHTML = q.note || "";
+      } catch (e) {
+        if (my !== seq) return;
+        $("#sout").value = "";
+        $("#squote").style.display = "none";
+        $("#snote").innerHTML = `<div class="alert err">${esc(errText(e))}</div>`;
+      }
+    }, 350);
+  }
+
+  // Token picker
+  const pick = (which) => {
+    const bg = document.createElement("div");
+    bg.className = "modal-bg";
+    bg.innerHTML = `<div class="modal picker"><h3>Select a token</h3>
+      <input class="inp" id="pq" placeholder="Search name, symbol or paste address" autocomplete="off"/>
+      <div class="plist" id="plist"></div><button class="btn ghost block" id="pclose" style="margin-top:10px">Close</button></div>`;
+    document.body.appendChild(bg);
+    const close = () => bg.remove();
+    bg.onclick = (e) => { if (e.target === bg) close(); };
+    $("#pclose", bg).onclick = close;
+    const other = which === "from" ? swapState.to : swapState.from;
+    const cfg = siteConfigId();
+    const sorted = [...tradable].sort((a, b) => isOfficial(b) - isOfficial(a) || isSiteConfig(b.configId) - isSiteConfig(a.configId) || (b.mcap || 0) - (a.mcap || 0));
+    const render_ = () => {
+      const q = $("#pq", bg).value.trim().toLowerCase();
+      const rows = [ETH_ASSET, ...sorted.map(assetFromLaunch)]
+        .filter((a) => !(other && other.kind === a.kind && (a.kind === "eth" || a.curve === other.curve)))
+        .filter((a) => !q || [a.symbol, a.name, a.token, a.curve].some((v) => String(v || "").toLowerCase().includes(q)))
+        .slice(0, 80);
+      $("#plist", bg).innerHTML = rows.length ? rows.map((a, i) => `<button class="prow" data-i="${i}">${a.kind === "eth" ? `<div class="avatar sm eth">Ξ</div>` : avatar(a, "sm")}
+          <span style="flex:1;min-width:0;text-align:left"><b>${esc(a.symbol)}</b> ${a.kind === "token" ? officialBadge(a) : ""}<br><span class="muted" style="font-size:12px">${esc(a.name)}</span></span>
+          ${a.kind === "token" ? statusBadge(a.status) : ""}</button>`).join("") : `<div class="muted" style="padding:14px">No tradable token found.</div>`;
+      $("#plist", bg).querySelectorAll(".prow").forEach((b) => (b.onclick = () => {
+        const a = rows[Number(b.dataset.i)];
+        swapState[which] = a;
+        close(); draw();
+      }));
+    };
+    $("#pq", bg).oninput = render_;
+    render_();
+    $("#pq", bg).focus();
+  };
+
+  $("#pickFrom").onclick = () => pick("from");
+  $("#pickTo").onclick = () => pick("to");
+  $("#flip").onclick = () => {
+    if (!swapState.to) return;
+    [swapState.from, swapState.to] = [swapState.to, swapState.from];
+    $("#samt").value = "";
+    draw();
+  };
+  $("#samt").oninput = requote;
+  $("#smax").onclick = async () => {
+    if (!W.address || swapState.from.kind !== "token") return;
+    $("#samt").value = formatUnits(await balanceOf(swapState.from.token, W.address), swapState.from.decimals);
+    requote();
+  };
+  // Popular tokens: tap one to buy it.
+  // Tokens launched on this launchpad first (Ammora's own test launches have meaningless market caps).
+  const ours = tradable.filter((x) => isSiteConfig(x.configId));
+  const pop = (ours.length ? ours : tradable).slice().sort((a, b) => isOfficial(b) - isOfficial(a) || (b.mcap || 0) - (a.mcap || 0)).slice(0, 5);
+  $("#swpop").innerHTML = pop.length ? pop.map((x, i) => `<button class="poprow" data-c="${x.curve}"><span class="poprank">${i + 1}</span>${avatar(x, "sm")}
+      <span class="popname"><b>$${esc(x.symbol || "?")}</b>${officialBadge(x)}<br><span class="muted">${esc(x.name || "Unnamed")}</span></span>
+      <span class="popcap"><b>${mc(x.mcap, 4)}</b><br><span class="muted">mcap</span></span></button>`).join("")
+    : `<div class="muted" style="padding:12px 0">No tradable tokens yet.</div>`;
+  document.querySelectorAll("#swpop .poprow").forEach((b) => (b.onclick = () => {
+    const x = tradable.find((y) => y.curve === b.dataset.c);
+    if (!x) return;
+    swapState.from = ETH_ASSET; swapState.to = assetFromLaunch(x);
+    $("#samt").value = ""; draw(); window.scrollTo({ top: 0, behavior: "smooth" });
+  }));
+  $("#sgo").onclick = async () => {
+    try {
+      await ensureWallet();
+      if (!swapState.to) return pick("to");
+      const amt = parseIn();
+      if (!amt) throw new Error("Enter an amount.");
+      if (swapState.from.kind === "token") {
+        const bal = await balanceOf(swapState.from.token, W.address);
+        if (bal < amt) throw new Error(`Insufficient ${swapState.from.symbol} balance.`);
+      }
+      $("#sgo").disabled = true;
+      const q = await quote(amt);
+      let steps;
+      if (q.legs.length === 1) {
+        const { e, side } = q.legs[0];
+        steps = await e.buildSteps(side, amt, swapState.slip);
+      } else {
+        // Leg 1: token A → WETH. Leg 2 spends exactly the WETH that leg 1 delivered.
+        const [l1, l2] = q.legs;
+        const wBefore = await balanceOf(WETH, W.address);
+        steps = await l1.e.buildSteps("sell", amt, swapState.slip);
+        steps.push({ label: `Buy ${l2.ctx.tok.symbol} with the WETH received`, run: async () => {
+          let got = 0n;
+          for (let i = 0; i < 5 && got <= 0n; i++) { got = (await balanceOf(WETH, W.address)) - wBefore; if (got <= 0n) await sleep(2000); }
+          if (got <= 0n) throw new Error("Could not confirm the WETH from the first trade. Your WETH is safe in your wallet; buy the second token from its page.");
+          for (const st of await l2.e.buildSteps("buy", got, swapState.slip)) await st.run();
+        } });
+      }
+      await stepModal("Swapping", steps).run();
+      tradeCtxCache.clear();
+      launchCache.at = 0;
+      $("#samt").value = "";
+      draw();
+    } catch (e) {
+      if (e.message !== "No wallet") toast(esc(errText(e)), "err", 9000);
+    } finally { const g = $("#sgo"); if (g) g.disabled = false; }
+  };
+  draw();
+}
+
+
+// ── Atomic first buy helpers ──────────────────────────────────────────────────
+// A fresh curve's first buy is fully determined by its Config, so the expected output can be
+// computed exactly (checked against live fresh curves to the wei) for plain-fee Configs.
+function atomicFirstBuyEligible(c) {
+  // A decaying fee schedule is fine: inside the launch transaction no time has passed, so the
+  // fee is exactly cliffFeeBps (unless the first-swap-min-fee option overrides it).
+  return !!c && !c.dynamicFeeEnabled && !c.rateLimiterEnabled && !c.enableFirstSwapWithMinFee
+    && Number(c.collectFeeMode) === 0 && Number(c.activationDelay) === 0;
+}
+function freshCurveBuyQuote(config, segments, amountIn) {
+  const Q2 = 1n << 128n;
+  const fee = amountIn * BigInt(config.cliffFeeBps) / 10_000n;
+  let rem = amountIn - fee, out = 0n, s = config.startSqrtPrice;
+  for (const seg of segments) {
+    if (rem <= 0n) break;
+    if (s >= seg.upperSqrtPrice) continue;
+    if (s < seg.lowerSqrtPrice) s = seg.lowerSqrtPrice;
+    const Lq = seg.liquidity;                                     // Q64-scaled liquidity
+    const maxIn = Lq * (seg.upperSqrtPrice - s) / Q2;             // quote needed to reach the segment top
+    let s1;
+    if (rem >= maxIn) { s1 = seg.upperSqrtPrice; rem -= maxIn; }
+    else { s1 = s + rem * Q2 / Lq; rem = 0n; }
+    out += Lq * (s1 - s) / (s * s1);                              // base released between s and s1
+    s = s1;
+  }
+  return { amountOut: out, fee, unfilled: rem };
+}
+
+/* ───────────────────────────── earnings (part of Portfolio) ───────────────────────────── */
+// Creator / partner launch fees (Ammora FeeVault) and graduated LP-position fees (ARL position NFTs).
+const TRANSFER_TOPIC = toEventSelector("Transfer(address,address,uint256)");
+let arlOptions = null;
+const dammOptions = () => (arlOptions ??= { deploymentSource: A.createAmmoraDeploymentSource([D]), factoryProfiles: A.giwaSepoliaAutoRoutePoolProfiles });
+
+// Fee loaders shared by the Portfolio page: FeeVault, LP positions and the wallet's own launches.
+// `report(key, value)` lets the page fill its summary tiles as each part arrives.
+function earningsLoaders(id, me, report = () => {}) {
+  // 1) FeeVault: creator + partner shares of bonding-curve trading fees, paid in WETH.
+  const loadVault = async () => {
+    try {
+      const vault = await pc.readContract({ address: L.factory, abi: A.ammoraLaunchFactoryV4Abi, functionName: "feeVault" });
+      const owed = await pc.readContract({ address: vault, abi: A.feeVaultAbi, functionName: "claimable", args: [WETH, me] });
+      if (id !== renderId) return;
+      report("vault", owed);
+      $("#evault").innerHTML = `<div class="earnrow"><div><div class="muted" style="font-size:12px">Claimable in the Ammora fee vault</div>
+        <div style="font-size:24px;font-weight:800">${fmtUnits(owed, 18, 6)} WETH</div>
+        <div class="muted" style="font-size:12px">Creator and partner shares from bonding-curve trades. The vault adds up all your launches.</div></div>
+        <button class="btn grad" id="eclaimv" ${owed > 0n ? "" : "disabled"}>${owed > 0n ? "Claim" : "Nothing to claim"}</button></div>`;
+      $("#eclaimv").onclick = async () => {
+        try {
+          await ensureWallet();
+          $("#eclaimv").disabled = true;
+          const tx = A.buildClaimFeeVaultFor(WETH, me, me);
+          await stepModal("Claiming fees", [{ label: `Claim ${fmtUnits(owed, 18, 6).replace(/<[^>]+>/g, "")} WETH`, run: () => sendTx({ to: vault, data: tx.data }, "Fee claim") }]).run();
+          setTimeout(loadVault, 2500);
+        } catch (e) { toast(esc(errText(e)), "err", 9000); const b = $("#eclaimv"); if (b) b.disabled = false; }
+      };
+    } catch (e) { if (id === renderId) $("#evault").innerHTML = `<div class="alert err">Could not read the fee vault: ${esc(errText(e))}</div>`; }
+  };
+
+  // 2) LP NFTs received at graduation (or later), found through ERC-721 Transfer logs to this wallet.
+  const loadLp = async () => {
+    try {
+      const PM = L.concentratedPositionManager;
+      const logs = await explorerLogs({ address: PM, topic0: TRANSFER_TOPIC, topic2: "0x" + me.slice(2).toLowerCase().padStart(64, "0") });
+      const ids = [...new Set(logs.map((l) => BigInt(l.topics[3])))].slice(-60);
+      const launches = await loadLaunches().catch(() => []);
+      // Read all positions in parallel (each needs owner, position and a fee simulation).
+      const rows = (await Promise.all(ids.map(async (tokenId) => {
+        const owner = await pc.readContract({ address: PM, abi: A.ammConcentratedPositionManagerV3Abi, functionName: "ownerOf", args: [tokenId] }).catch(() => null);
+        if (!owner || owner.toLowerCase() !== me.toLowerCase()) return null;
+        const pos = await pc.readContract({ address: PM, abi: A.ammConcentratedPositionManagerV3Abi, functionName: "getPosition", args: [tokenId] });
+        let base = 0n, quote = 0n;
+        try {
+          const { result } = await pc.simulateContract({ address: PM, abi: A.ammConcentratedPositionManagerV3Abi, functionName: "claimPositionFees", args: [tokenId, me], account: me });
+          [base, quote] = result;
+        } catch {}
+        const launch = launches.find((x) => x.pool && x.pool.toLowerCase() === pos.pool.toLowerCase());
+        return { tokenId, pool: pos.pool, base, quote, launch, locked: pos.permanentLockedLiquidity > 0n };
+      }))).filter(Boolean);
+      if (id !== renderId) return;
+      report("lp", rows.reduce((s, r) => s + r.quote, 0n));
+      if (!rows.length) { $("#elp").innerHTML = `<div class="muted">No liquidity positions yet. When a token you created (or partnered) graduates, its LP position appears here and keeps earning pool fees.</div>`; return; }
+      $("#elp").innerHTML = `<div style="overflow:auto"><table><thead><tr><th>Position</th><th>Token</th><th>Claimable</th><th></th></tr></thead><tbody>
+        ${rows.map((r, i) => {
+          const dec = r.launch?.decimals ?? 9, sym = r.launch?.symbol || "token";
+          const has = r.base > 0n || r.quote > 0n;
+          return `<tr><td>#${r.tokenId}${r.locked ? ` <span class="badge b-grad">locked</span>` : ""}</td>
+            <td>${r.launch ? `<a href="#/token/${r.launch.curve}">$${esc(sym)}</a>` : `<a class="mono" href="${addrUrl(r.pool)}" target="_blank" rel="noopener">${short(r.pool)}</a>`}</td>
+            <td>${fmtUnits(r.quote, 18, 6)} WETH<br><span class="muted">${fmtUnits(r.base, dec)} ${esc(sym)}</span></td>
+            <td style="text-align:right"><button class="btn small ${has ? "grad" : "ghost"}" data-i="${i}" ${has ? "" : "disabled"}>${has ? "Claim" : "—"}</button></td></tr>`;
+        }).join("")}</tbody></table></div>
+        <div class="note">Locked positions cannot be withdrawn, but their trading fees are always claimable.</div>`;
+      $("#elp").querySelectorAll("button[data-i]").forEach((b) => (b.onclick = async () => {
+        const r = rows[Number(b.dataset.i)];
+        try {
+          await ensureWallet();
+          b.disabled = true;
+          const sdk = new A.DammV2Client(pc, r.pool, "concentrated", L.concentratedFactory, L.concentratedPositionManager, dammOptions());
+          await stepModal("Claiming LP fees", [{ label: `Claim fees of position #${r.tokenId}`, run: async () => {
+            const tx = await sdk.planClaimManagedConcentratedFees(r.tokenId, me, me);
+            return sendTx({ to: tx.to, data: tx.data }, "LP fee claim");
+          } }]).run();
+          setTimeout(loadLp, 2500);
+        } catch (e) { toast(esc(errText(e)), "err", 9000); b.disabled = false; }
+      }));
+    } catch (e) { if (id === renderId) $("#elp").innerHTML = `<div class="alert err">Could not load positions: ${esc(errText(e))}</div>`; }
+  };
+
+  // 3) Tokens this wallet created.
+  const loadMine = async () => {
+    try {
+      const list = (await loadLaunches()).filter((x) => x.creator.toLowerCase() === me.toLowerCase() && !isHidden(x.token, x.curve));
+      if (id !== renderId) return;
+      report("launched", list.length);
+      $("#emine").innerHTML = list.length ? `<div class="grid" style="margin:0">${list.slice(0, 30).map((x) => `
+        <a class="card lcard" href="#/token/${x.curve}"><div class="lhead">${avatar(x)}<div style="min-width:0;flex:1"><div class="lname">${esc(x.name || "Unnamed")}</div><div class="lsym">$${esc(x.symbol || "")}</div></div>${statusBadge(x.status)}</div>
+        <div><div class="row" style="margin-bottom:6px"><span class="muted">Bonding curve</span><b>${pct(x.progress, 1)}%</b></div><div class="bar"><i style="width:${(x.progress * 100).toFixed(1)}%"></i></div></div></a>`).join("")}</div>`
+        : `<div class="muted">You have not launched a token yet. <a href="#/create">Launch one →</a></div>`;
+    } catch { if (id === renderId) $("#emine").innerHTML = `<div class="muted">Could not load your launches.</div>`; }
+  };
+
+  return { loadVault, loadLp, loadMine };
+}
+
+/* ───────────────────────────── views: portfolio ───────────────────────────── */
+// Everything about one wallet: what it holds, what it can claim, what it launched and its trades.
+async function viewPortfolio(id) {
+  const head = `<div class="phero"><div><span class="chip">Portfolio</span>
+    <h2>Your portfolio</h2>
+    <div class="muted">What you hold, the fees you can claim, the tokens you launched and every trade you made on Ammora launches.</div></div>
+    <a class="btn ghost" href="#/create">Launch a token</a></div>`;
+  if (!W.address) {
+    app.innerHTML = `<div class="pwrap">${head}
+      <div class="card empty-card"><b>Connect a wallet to see your portfolio</b>
+      <div class="muted">Holdings, claimable fees, your launches and your trades, all read straight from GIWA.</div>
+      <button class="btn grad" id="pconnect" style="margin-top:6px">Connect wallet</button></div></div>`;
+    $("#pconnect").onclick = async () => { try { await connect(); await ensureChain(); render(); } catch (e) { if (e.message !== "No wallet" && !e.cancelled) toast(esc(errText(e)), "err"); } };
+    return;
+  }
+  const me = W.address;
+  const tile = (key, label, sub) => `<div class="stat"><div class="k">${label}</div><div class="v" id="pt-${key}"><span class="skel" style="display:block;height:24px;margin-top:6px"></span></div><div class="psub" id="ps-${key}">${sub}</div></div>`;
+  app.innerHTML = `<div class="pwrap">${head}
+    <div class="stats">
+      ${tile("hold", "Holdings", "value of the tokens you hold")}
+      ${tile("fees", "Fees to claim", "launch fees + LP positions")}
+      ${tile("launched", "Launched", "tokens you created")}
+      ${tile("trades", "Trades", "buys and sells")}
+    </div>
+    <div class="card psec"><div class="psec-h"><h3>Holdings</h3><span class="muted" id="pwallet"></span></div><div id="phold"><div class="skel" style="height:80px"></div></div></div>
+    <div class="card psec"><div class="psec-h"><h3>Earnings</h3><span class="muted">Fees you earn as a token creator, as a launchpad partner and from graduated liquidity</span></div>
+      <div class="sect" style="margin-top:6px">Launch trading fees</div><div id="evault"><div class="skel" style="height:60px"></div></div>
+      <div class="sect">Graduated liquidity positions</div><div id="elp"><div class="skel" style="height:60px"></div></div></div>
+    <div class="card psec"><div class="psec-h"><h3>Your launches</h3></div><div id="emine"><div class="skel" style="height:40px"></div></div></div>
+    <div class="card psec"><div class="psec-h"><h3>Trades</h3><span class="muted">Your buys and sells on Ammora launches, newest first</span></div><div id="ptrades"><div class="skel" style="height:80px"></div></div></div>
+  </div>`;
+
+  // Summary tiles fill in as each part finishes.
+  const fees = { vault: null, lp: null };
+  const report = (k, v) => {
+    if (k === "launched") { $("#pt-launched") && ($("#pt-launched").textContent = String(v)); return; }
+    fees[k] = v;
+    if (fees.vault !== null && fees.lp !== null && $("#pt-fees")) {
+      const t = fees.vault + fees.lp;
+      $("#pt-fees").innerHTML = `${fmtUnits(t, 18, 6)} <small>WETH</small>`;
+    }
+  };
+  const { loadVault, loadLp, loadMine } = earningsLoaders(id, me, report);
+  loadVault(); loadMine(); loadLp();
+
+  // Holdings: balances of every Ammora launch token + ETH/WETH, valued at the current price
+  // (bonding-curve price while live, ARL pool price after graduation).
+  const launches = await loadLaunches().catch(() => []);
+  const loadHoldings = async () => {
+    try {
+      const list = launches.filter((x) => x.token && x.status !== undefined);
+      const calls = list.map((x) => ({ address: x.token, abi: erc20Abi, functionName: "balanceOf", args: [me] }));
+      const res = [];
+      for (let i = 0; i < calls.length; i += 250) res.push(...await pc.multicall({ contracts: calls.slice(i, i + 250), allowFailure: true }));
+      const [ethBal, wethBal] = await Promise.all([pc.getBalance({ address: me }), pc.readContract({ address: WETH, abi: erc20Abi, functionName: "balanceOf", args: [me] })]);
+      const held = list.map((x, i) => ({ x, bal: res[i]?.status === "success" ? res[i].result : 0n })).filter((h) => h.bal > 0n);
+      // Graduated tokens trade in their ARL pool: read the pool price.
+      const grads = held.filter((h) => h.x.status === 3 && h.x.pool);
+      if (grads.length) {
+        const pr = await pc.multicall({ contracts: grads.map((h) => ({ address: h.x.pool, abi: A.ammConcentratedPoolV3Abi, functionName: "sqrtPrice" })), allowFailure: true });
+        grads.forEach((h, i) => { if (pr[i]?.status === "success") h.poolPrice = sqrtToPrice(pr[i].result, h.x.decimals); });
+      }
+      held.forEach((h) => { h.price = h.poolPrice ?? h.x.price ?? 0; h.amount = Number(formatUnits(h.bal, h.x.decimals)); h.value = h.amount * h.price; });
+      held.sort((a, b) => b.value - a.value);
+      if (id !== renderId) return;
+      const total = held.reduce((s, h) => s + h.value, 0);
+      $("#pt-hold").innerHTML = `${fmtNum(total, 6)} <small>ETH</small>`;
+      $("#ps-hold").textContent = `${held.length} token${held.length === 1 ? "" : "s"} you hold`;
+      $("#pwallet").innerHTML = `Wallet: <b>${fmtUnits(ethBal, 18, 5)}</b> ETH · <b>${fmtUnits(wethBal, 18, 5)}</b> WETH`;
+      $("#phold").innerHTML = held.length ? `<div style="overflow:auto"><table class="ptable"><thead><tr><th>Token</th><th>Balance</th><th>Price</th><th>Value</th><th>Status</th><th></th></tr></thead><tbody>
+        ${held.map((h) => `<tr>
+          <td><a class="ptok" href="#/token/${h.x.curve}">${avatar(h.x, "sm")}<span><b>${esc(h.x.name || "Unnamed")}</b>${officialBadge(h.x)}<br><span class="muted">$${esc(h.x.symbol || "")}</span></span></a></td>
+          <td>${fmtNum(h.amount)}</td>
+          <td>${h.price ? (h.price < 0.001 ? fmtTiny(h.price) : fmtNum(h.price, 6)) + " ETH" : "—"}</td>
+          <td><b>${fmtNum(h.value, 6)} ETH</b></td>
+          <td>${statusBadge(h.x.status)}</td>
+          <td style="text-align:right">${h.x.status === 1 || h.x.status === 3 ? `<a class="btn small ghost" href="#/token/${h.x.curve}">Trade</a>` : ""}</td></tr>`).join("")}
+        </tbody></table></div>` : `<div class="muted">You don't hold any Ammora launch tokens yet. <a href="#/">Explore launches →</a></div>`;
+    } catch (e) {
+      if (id === renderId) { $("#phold").innerHTML = `<div class="alert err">Could not load holdings: ${esc(errText(e))}</div>`; $("#pt-hold").textContent = "—"; }
+    }
+  };
+
+  // Trades: the explorer's ERC-20 transfer history for this wallet, grouped per transaction.
+  const loadTrades = async () => {
+    try {
+      const byToken = new Map(launches.map((x) => [x.token?.toLowerCase(), x]));
+      const q = new URLSearchParams({ module: "account", action: "tokentx", address: me, sort: "desc", page: "1", offset: "1000" });
+      const c = new AbortController(); const t = setTimeout(() => c.abort(), 30000);
+      const j = await fetch(`${EXPLORER}/api?${q}`, { signal: c.signal }).then((r) => r.json()).finally(() => clearTimeout(t));
+      const txs = Array.isArray(j.result) ? j.result : [];
+      const mine = me.toLowerCase(), weth = WETH.toLowerCase(), zero = "0x0000000000000000000000000000000000000000";
+      const groups = new Map();
+      for (const x of txs) {
+        if (!groups.has(x.hash)) groups.set(x.hash, { hash: x.hash, time: Number(x.timeStamp), parts: [] });
+        groups.get(x.hash).parts.push(x);
+      }
+      const rows = [];
+      for (const g of groups.values()) {
+        let wethIn = 0n, wethOut = 0n;
+        for (const p of g.parts) if (p.contractAddress.toLowerCase() === weth && p.from !== zero && p.to !== zero) {
+          if (p.to.toLowerCase() === mine) wethIn += BigInt(p.value); if (p.from.toLowerCase() === mine) wethOut += BigInt(p.value);
+        }
+        const toks = new Map();
+        for (const p of g.parts) {
+          const l = byToken.get(p.contractAddress.toLowerCase());
+          if (!l) continue;
+          const d = toks.get(l.token) || { l, net: 0n };
+          if (p.to.toLowerCase() === mine) d.net += BigInt(p.value);
+          if (p.from.toLowerCase() === mine) d.net -= BigInt(p.value);
+          toks.set(l.token, d);
+        }
+        for (const { l, net } of toks.values()) {
+          if (net === 0n) continue;
+          let side;
+          if (net > 0n && wethOut > 0n) side = "Buy";
+          else if (net < 0n && wethIn > 0n) side = "Sell";
+          else if (net > 0n && wethIn > 0n) side = "Claim";
+          else side = net > 0n ? "Received" : "Sent";
+          rows.push({ l, side, amount: net < 0n ? -net : net, weth: side === "Buy" ? wethOut : side === "Sell" || side === "Claim" ? wethIn : 0n, hash: g.hash, time: g.time });
+        }
+      }
+      if (id !== renderId) return;
+      const trades = rows.filter((r) => r.side === "Buy" || r.side === "Sell").length;
+      $("#pt-trades").textContent = String(trades);
+      $("#ps-trades").textContent = `${rows.filter((r) => r.side === "Buy").length} buys · ${rows.filter((r) => r.side === "Sell").length} sells`;
+      const sideBadge = (s) => `<span class="badge ${s === "Buy" ? "b-live" : s === "Sell" ? "b-sell" : "b-off"}">${s}</span>`;
+      $("#ptrades").innerHTML = rows.length ? `<div style="overflow:auto"><table class="ptable"><thead><tr><th>Token</th><th>Side</th><th>Tokens</th><th>Paid or received</th><th>When</th><th></th></tr></thead><tbody>
+        ${rows.slice(0, 200).map((r) => `<tr>
+          <td><a class="ptok" href="#/token/${r.l.curve}">${avatar(r.l, "sm")}<span><b>$${esc(r.l.symbol || "?")}</b></span></a></td>
+          <td>${sideBadge(r.side)}</td>
+          <td>${fmtUnits(r.amount, r.l.decimals ?? 9)}</td>
+          <td>${r.weth > 0n ? `${r.side === "Buy" ? "−" : "+"}${fmtUnits(r.weth, 18, 6)} WETH` : "—"}</td>
+          <td class="muted">${timeAgo(r.time)}</td>
+          <td style="text-align:right"><a class="mono" href="${txUrl(r.hash)}" target="_blank" rel="noopener">${r.hash.slice(0, 8)}… ↗</a></td></tr>`).join("")}
+        </tbody></table></div>` : `<div class="muted">No trades yet. Your buys and sells on Ammora launches will show up here.</div>`;
+    } catch (e) {
+      if (id === renderId) { $("#ptrades").innerHTML = `<div class="alert err">Could not load trades: ${esc(errText(e))}</div>`; $("#pt-trades").textContent = "—"; }
+    }
+  };
+  loadHoldings(); loadTrades();
+}
+
+/* ───────────────────────────── views: create ───────────────────────────── */
+let coreVerified = null;
+const verifyCore = async (bn) => (coreVerified ??= A.verifyAmmoraV4CoreAtBlock(pc, CORE, bn).catch((e) => { coreVerified = null; throw e; }));
+
+async function viewCreate(id) {
+  let cfgId = PRESETS[0]?.id ?? siteConfigId();
+  app.innerHTML = `
+  <div class="lpage">
+    <div class="lgrid">
+      <div class="card lform">
+        <h2 class="gtitle">Launch a token</h2>
+        <div class="muted lsub">One transaction creates your token and its bonding curve. When the curve fills, it graduates into a permanent Ammora pool.</div>
+
+        <label class="l">Image <span class="opt">optional</span></label>
+        <label class="drop" id="drop"><input type="file" id="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden/>
+          <div id="imgprev" class="avatar">＋</div>
+          <div><span class="dropbtn">Choose image</span><div class="muted" style="font-size:12px;margin-top:4px">PNG, JPEG, WebP or GIF · or drop it here</div></div></label>
+        <div class="help" id="metahelp">Stored fully on-chain, so it is compressed to fit.</div>
+
+        <div class="fgrid">
+          <div><label class="l">Name <span class="cnt" id="c-name">0/40</span></label><input class="inp" id="name" maxlength="40" placeholder="Name"/></div>
+          <div><label class="l">Ticker <span class="cnt" id="c-sym">0/12</span></label><input class="inp" id="sym" maxlength="12" placeholder="Ticker"/></div>
+        </div>
+
+        <div class="lbox">
+          <label class="l">Description and links <span class="opt">optional</span></label>
+          <textarea class="inp" id="desc" maxlength="280" placeholder="What is it, and why hold it?"></textarea>
+          <div class="cnt" style="float:none;text-align:right;margin-top:4px" id="c-desc">0/280</div>
+          <div class="linkrow">
+            <label class="pfx"><span>x.com/</span><input id="tw" placeholder="handle" autocomplete="off"/></label>
+            <label class="pfx"><span>t.me/</span><input id="tg" placeholder="group" autocomplete="off"/></label>
+            <label class="pfx"><span>https://</span><input id="web" placeholder="website" autocomplete="off"/></label>
+          </div>
+        </div>
+
+        ${PRESETS.length > 1 ? `<label class="l">Launch type <span class="opt">fixed at launch</span></label>
+        <div class="segctl" id="presets">${PRESETS.map((p, i) => `<button type="button" class="preset ${i === 0 ? "on" : ""}" data-i="${i}">${esc(p.name)}</button>`).join("")}</div>
+        <div class="help" id="presetdesc">${esc(PRESETS[0].description || "")}</div>` : ""}
+
+        <label class="l" style="margin-top:18px">Your first buy <span class="opt">optional</span></label>
+        <div class="swpanel lbuy"><div class="swmid"><input id="first" inputmode="decimal" placeholder="0" autocomplete="off"/><span class="assetbtn"><div class="avatar sm eth">Ξ</div><b>ETH</b></span></div></div>
+        <div class="quick" id="fquick">${["0", "0.001", "0.005", "0.01"].map((v, i) => `<button type="button" data-v="${v}" class="${i === 0 ? "on" : ""}">${v === "0" ? "None" : v + " ETH"}</button>`).join("")}</div>
+        <div class="help" id="firsthelp">Bought in the same transaction as the launch, so nobody can buy before you.</div>
+
+        <div class="lfoot">
+          <div id="cmsg"></div>
+          <div class="still" id="still"></div>
+          <button class="btn grad block swgo" id="launch">${W.address ? "Launch token" : "Connect wallet"}</button>
+          <div class="swfoot"><span>Free to launch, network fee only</span><span>·</span><span id="feeline">1% fee per trade</span></div>
+        </div>
+      </div>
+      <aside class="lprev">
+        <div class="pvlabel">How Explore lists it</div>
+        <div class="card pvcard">
+          <div class="pvhead"><div id="pvimg" class="avatar">?</div>
+            <div style="min-width:0"><div class="pvname" id="pvname">Your token</div><div class="muted" id="pvsym">$TICKER</div></div></div>
+          <div class="pvcap"><b id="pvcap">—</b><span>opening market cap</span></div>
+          <div class="pvdesc muted" id="pvdesc"></div>
+          <div id="cfginfo" class="pvrows"><div class="skel" style="height:14px"></div><div class="skel" style="height:14px"></div><div class="skel" style="height:14px"></div></div>
+          <div class="pvpay"><span>You pay</span><b id="pvpay">0 ETH</b></div>
+        </div>
+      </aside>
+    </div>
+  </div>`;
+
+  let cfg = null, imgBmp = null, fitted = null;
+  // Live preview on the right + "still needed" hint above the button.
+  const updatePreview = () => {
+    const name = $("#name").value.trim(), sym = $("#sym").value.trim().toUpperCase(), desc = $("#desc").value.trim();
+    $("#pvname").textContent = name || "Your token";
+    $("#pvsym").textContent = "$" + (sym || "TICKER");
+    $("#pvdesc").textContent = desc;
+    $("#c-name").textContent = `${name.length}/40`; $("#c-sym").textContent = `${sym.length}/12`; $("#c-desc").textContent = `${desc.length}/280`;
+    let first = 0n;
+    try { const v = $("#first").value.trim(); first = v ? parseUnits(v, 18) : 0n; } catch {}
+    document.querySelectorAll("#fquick button").forEach((b) => b.classList.toggle("on", (b.dataset.v === "0" && first === 0n) || (first > 0n && b.dataset.v === $("#first").value.trim())));
+    const fee = cfg ? cfg.config.poolCreationFee : 0n;
+    $("#pvpay").textContent = `${fmtUnits(fee + first, 18, 6)} ETH`;
+    const need = [!name && "a name", !sym && "a ticker"].filter(Boolean);
+    $("#still").innerHTML = need.length ? `Still needed: ${need.map((n) => `<b>${n}</b>`).join(" and ")}` : "";
+    const get = $("#pv-get");
+    if (get) {
+      if (!cfg || first <= 0n) get.textContent = "None";
+      else {
+        const q = freshCurveBuyQuote(cfg.config, cfg.segments, first);
+        get.textContent = q.unfilled > 0n ? "Too large for the curve" : `${fmtUnits(q.amountOut, cfg.config.tokenDecimals)} ${sym || "tokens"}`;
+      }
+    }
+  };
+  const loadCfg = async () => {
+    const want = cfgId;
+    $("#cmsg").innerHTML = "";
+    $("#cfginfo").innerHTML = `<div class="skel" style="height:14px"></div><div class="skel" style="height:14px"></div><div class="skel" style="height:14px"></div>`;
+    try {
+      const bn = await pc.getBlockNumber();
+      const entry = await A.getAmmoraV4ConfigAtBlock(pc, L.configRegistry, want, bn);
+      if (id !== renderId || want !== cfgId) return;
+      cfg = entry;
+      const c = cfg.config;
+      const sched = Number(c.feeSchedulerMode) === 1;
+      const endFee = sched ? Number(c.cliffFeeBps) - Number(c.feeReductionFactorBps) * Number(c.feeNumberOfPeriods) : Number(c.cliffFeeBps);
+      const supply = Number(formatUnits(c.totalSupply, c.tokenDecimals));
+      const feeText = sched ? `${(c.cliffFeeBps / 100).toFixed(0)}% → ${(endFee / 100).toFixed(0)}% in ${Math.round(Number(c.feeNumberOfPeriods) * Number(c.feePeriodFrequency) / 60)} min` : `${(c.cliffFeeBps / 100).toFixed(0)}%`;
+      $("#pvcap").textContent = mc(sqrtToPrice(c.startSqrtPrice, c.tokenDecimals) * supply, 4);
+      $("#feeline").textContent = sched ? `${feeText} fee per trade` : `${feeText} fee per trade`;
+      $("#cfginfo").innerHTML = `
+        <div><span>Fee per trade</span><b>${feeText}</b></div>
+        <div><span>Graduates at</span><b>${fmtUnits(c.migrationQuoteThreshold, 18)} ETH</b></div>
+        <div><span>Supply</span><b>${fmtUnits(c.totalSupply, c.tokenDecimals)}</b></div>
+        <div><span>First buy</span><b id="pv-get">None</b></div>`;
+      $("#firsthelp").innerHTML = sched
+        ? `On an anti-sniper launch your first buy also pays the <b>${(c.cliffFeeBps / 100).toFixed(0)}% launch fee</b>, so keep it small or skip it.`
+        : "Bought in the same transaction as the launch, so nobody can buy before you.";
+      if (!cfg.enabled) $("#cmsg").innerHTML = `<div class="alert err">This launch type is not available right now.</div>`;
+      updatePreview();
+    } catch (e) {
+      if (id === renderId && want === cfgId) $("#cfginfo").innerHTML = `<div class="alert err">Could not load launch settings: ${esc(errText(e))}</div>`;
+    }
+  };
+  document.querySelectorAll("#presets .preset").forEach((b) => (b.onclick = () => {
+    document.querySelectorAll("#presets .preset").forEach((x) => x.classList.toggle("on", x === b));
+    const p = PRESETS[Number(b.dataset.i)];
+    cfgId = p.id;
+    $("#presetdesc").textContent = p.description || "";
+    cfg = null;
+    loadCfg();
+  }));
+  document.querySelectorAll("#fquick button").forEach((b) => (b.onclick = () => { $("#first").value = b.dataset.v === "0" ? "" : b.dataset.v; updatePreview(); }));
+  ["#name", "#sym", "#desc", "#first"].forEach((sel) => $(sel).addEventListener("input", updatePreview));
+  updatePreview();
+  // Drag & drop an image onto the picker.
+  const drop = $("#drop");
+  ["dragenter", "dragover"].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+  ["dragleave", "drop"].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+  drop.addEventListener("drop", (e) => {
+    const f = e.dataTransfer?.files?.[0];
+    if (f) { const dt = new DataTransfer(); dt.items.add(f); $("#file").files = dt.files; $("#file").dispatchEvent(new Event("change")); }
+  });
+  await loadCfg();
+
+  const setPrev = (src) => {
+    for (const idSel of ["imgprev", "pvimg"]) {
+      const el = document.getElementById(idSel);
+      if (!el) continue;
+      el.outerHTML = src ? `<img id="${idSel}" class="avatar" src="${esc(src)}" alt="">` : `<div id="${idSel}" class="avatar">${idSel === "imgprev" ? "＋" : "?"}</div>`;
+    }
+  };
+  // Links are typed as handles (x.com/<handle>, t.me/<group>) or a bare domain; full URLs work too.
+  const linkVal = (sel, base) => {
+    let v = $(sel).value.trim();
+    if (!v) return undefined;
+    if (!/^https?:\/\//i.test(v)) v = base + v.replace(/^@/, "").replace(/^(x\.com|twitter\.com|t\.me)\//i, "");
+    return safeUrl(v) || undefined;
+  };
+  const baseMeta = () => ({
+    name: $("#name").value.trim(), symbol: $("#sym").value.trim().toUpperCase(),
+    description: $("#desc").value.trim() || undefined,
+    website: linkVal("#web", "https://"), twitter: linkVal("#tw", "https://x.com/"), telegram: linkVal("#tg", "https://t.me/"),
+    launchpad: SITE.name,
+  });
+  // Recompute the exact on-chain metadata (and the image size that fits) whenever an input changes.
+  let fitTimer;
+  const refit = () => {
+    clearTimeout(fitTimer);
+    fitTimer = setTimeout(() => {
+      try {
+        fitted = buildMetadataUri(baseMeta(), imgBmp);
+        if (imgBmp) setPrev(fitted.image);
+        const used = utf8Bytes(fitted.uri);
+        $("#metahelp").innerHTML = fitted.tooBig
+          ? `<span class="bad">The image does not fit next to this much text. Shorten the description or links (on-chain limit ${META_LIMIT.toLocaleString("en-US")} bytes).</span>`
+          : `Stored fully on-chain · ${used.toLocaleString("en-US")} / ${META_LIMIT.toLocaleString("en-US")} bytes used${fitted.image ? ` · image ${fitted.size}px` : ""}`;
+      } catch (e) {
+        fitted = null;
+        $("#metahelp").innerHTML = `<span class="bad">${esc(e.message)}</span>`;
+      }
+    }, 250);
+  };
+  ["#name", "#sym", "#desc", "#web", "#tw", "#tg"].forEach((sel) => ($(sel).oninput = refit));
+  $("#file").onchange = async (e) => {
+    const f = e.target.files?.[0];
+    imgBmp = null;
+    if (f) { try { imgBmp = await createImageBitmap(f); } catch { toast("Could not read that image.", "err"); } }
+    if (!imgBmp) setPrev(null);
+    refit();
+  };
+  refit();
+
+  $("#launch").onclick = async () => {
+    const name = $("#name").value.trim(), symbol = $("#sym").value.trim().toUpperCase();
+    try {
+      if (!name || !symbol) throw new Error("Name and ticker are required.");
+      if (!/^[A-Z0-9$_.-]{1,12}$/.test(symbol)) throw new Error("Ticker: 1–12 letters/numbers.");
+      const firstStr = $("#first").value.trim();
+      const firstBuy = firstStr ? parseUnits(firstStr, 18) : 0n;
+      await ensureWallet();
+      if (!cfg?.enabled) throw new Error("The selected launch Config is not available.");
+      const built = buildMetadataUri({ ...baseMeta(), name, symbol }, imgBmp);
+      if (built.tooBig) throw new Error("The image does not fit next to this much text. Shorten the description or links, or remove the image.");
+      const metadataURI = built.uri;
+      const meta = built.meta;
+      $("#launch").disabled = true;
+      let created, atomicDone = false;
+      const recordLaunch = (receipt) => {
+        created = A.parseAmmoraV4LaunchCreatedReceipt(receipt, L.factory);
+        if (created.configId !== cfgId || created.configHash !== cfg.configHash) throw new Error("Launch receipt does not match the selected Config.");
+        rememberLaunch({ token: created.token, curve: created.curve, creator: W.address, configId: cfgId, configHash: cfg.configHash, metadataURI, block: Number(receipt.blockNumber), time: Math.floor(Date.now() / 1000), tx: receipt.transactionHash });
+        metaCache.set(metadataURI, meta);
+        launchCache.at = 0;
+      };
+      const launchArgs = () => ({ name, symbol, metadataURI, creatorMetadataURI: metadataURI, tokenDecimals: cfg.config.tokenDecimals });
+      const steps = [
+        { label: "Verify Ammora V4 contracts & Config", run: async () => {
+          const bn = await pc.getBlockNumber();
+          await verifyCore(bn);
+          cfg = await A.getAmmoraV4ConfigAtBlock(pc, L.configRegistry, cfgId, bn);
+          if (!cfg.enabled) throw new Error(`Config #${cfgId} is disabled.`);
+          const ethBal = await pc.getBalance({ address: W.address });
+          if (ethBal < cfg.config.poolCreationFee + firstBuy) throw new Error("Not enough ETH for the creation fee and initial buy (plus gas).");
+        } },
+      ];
+      if (firstBuy > 0n && atomicFirstBuyEligible(cfg?.config)) {
+        // Launch + first buy in ONE transaction through Ammora's FirstBuyExecutor: nobody can buy before the creator.
+        const planAtomic = async () => {
+          const bn = await pc.getBlockNumber();
+          const ctx = await A.verifyAmmoraPortableDeploymentAtBlock(pc, A.giwaSepoliaAtomicLaunchDeployment, bn);
+          const quoteOut = freshCurveBuyQuote(cfg.config, cfg.segments, firstBuy);
+          if (quoteOut.unfilled > 0n || quoteOut.amountOut <= 0n) throw new Error("The initial buy is larger than the bonding curve allows. Use a smaller amount.");
+          const fees = await pc.estimateFeesPerGas();
+          return new A.AmmoraPortableLifecyclePlanner(ctx, A.giwaSepoliaAtomicLaunchTargets).planExistingConfigAtomicFirstBuy({
+            account: W.address, configId: cfgId, expectedConfigHash: cfg.configHash, launch: launchArgs(),
+            firstBuys: [{ includedQuoteAmountRaw: firstBuy, minimumBaseAmountOutRaw: quoteOut.amountOut * 99n / 100n, allowPartialFill: false, recipient: W.address }],
+            deadline: nowSec() + 1800n, allowancePolicy: "prepare-approval",
+            gas: { maxFeePerGasNativeRaw: (fees.maxFeePerGas ?? fees.gasPrice ?? 1_000_000n) * 2n, safetyMarginBps: 2000n },
+          });
+        };
+        steps.push(
+          { label: "Prepare WETH for the first buy", run: async () => {
+            const wbal = await balanceOf(WETH, W.address);
+            if (wbal >= firstBuy) return;
+            const diff = firstBuy - wbal;
+            return sendTx({ to: WETH, data: encodeFunctionData({ abi: wethAbi, functionName: "deposit" }), value: diff }, "Wrap ETH");
+          } },
+          { label: "Approve the first buy (exact amount)", run: async () => {
+            const plan = await planAtomic();
+            if (plan.status !== "APPROVAL_REQUIRED") return;
+            const a = plan.approvalRequirements?.[0];
+            if (!a || a.token.toLowerCase() !== WETH.toLowerCase() || a.exactAmountRaw !== firstBuy) throw new Error("Unexpected approval request from the planner.");
+            return sendTx(plan.transaction, "Approval");
+          } },
+          { label: `Create $${symbol} + first buy in one transaction`, run: async () => {
+            let plan;
+            for (let i = 0; i < 4; i++) {                   // RPC replicas can lag behind the approval
+              plan = await planAtomic();
+              if (plan.status === "READY") break;
+              await sleep(2500);
+            }
+            if (plan.status !== "READY") throw new Error("The approval is not visible yet. Wait a few seconds and try again.");
+            if (plan.transaction.to.toLowerCase() !== L.factory.toLowerCase()) throw new Error("Unexpected launch target.");
+            const receipt = await sendTx({ to: plan.transaction.to, data: plan.transaction.data, value: plan.transaction.value ?? 0n }, "Launch + first buy");
+            recordLaunch(receipt);
+            atomicDone = true;
+          } },
+        );
+      } else {
+        steps.push({ label: `Create $${symbol} + bonding curve`, run: async () => {
+          const tx = A.buildCreateAmmoraV4Launch(launchArgs(), cfgId, cfg.config.poolCreationFee);
+          recordLaunch(await sendTx({ to: L.factory, data: tx.data, value: tx.value ?? 0n }, "Token launch"));
+        } });
+      }
+      await stepModal(`Launching ${name}`, steps).run();
+      const needsBuy = firstBuy > 0n && !atomicDone;
+      if (needsBuy) sessionStorage.setItem("moralume.prefillBuy", firstStr);
+      toast(`🎉 $${esc(symbol)} is live!${atomicDone ? " Your first buy is in." : needsBuy ? " Confirm your initial buy on the token page." : ""}`, "ok", 9000);
+      await sleep(1500);
+      location.hash = `#/token/${created.curve}`;
+    } catch (e) {
+      $("#cmsg").innerHTML = `<div class="alert err">${esc(errText(e))}</div>`;
+    } finally { const b = $("#launch"); if (b) b.disabled = false; }
+  };
+}
+
+// Ammora V4 limits launch.metadataURI to 2048 UTF-8 bytes. Metadata is written as a plain JSON
+// data: URI (not base64), so the embedded image's base64 is not inflated a second time.
+const META_LIMIT = 2048;
+const utf8Bytes = (str) => new TextEncoder().encode(str).length;
+const toJsonDataUri = (obj) => "data:application/json," +
+  JSON.stringify(obj).replace(/[%#\u0000-\u001f\u007f-\u{10ffff}]/gu, (ch) => encodeURIComponent(ch));
+// Largest/sharpest first; the first combination that fits the limit wins.
+const IMAGE_STEPS = [[96, 0.6], [80, 0.6], [72, 0.6], [64, 0.65], [64, 0.5], [56, 0.55], [48, 0.6], [48, 0.45], [40, 0.5], [32, 0.6], [32, 0.4]];
+function encodeImage(bmp, size, quality) {
+  const c = document.createElement("canvas");
+  c.width = c.height = size;
+  const g = c.getContext("2d");
+  g.fillStyle = "#ffffff";
+  g.fillRect(0, 0, size, size);
+  const k = Math.max(size / bmp.width, size / bmp.height);
+  const w = bmp.width * k, h = bmp.height * k;
+  g.drawImage(bmp, (size - w) / 2, (size - h) / 2, w, h);
+  const webp = c.toDataURL("image/webp", quality);
+  return webp.startsWith("data:image/webp") ? webp : c.toDataURL("image/jpeg", quality);
+}
+function buildMetadataUri(base, bmp) {
+  const meta = JSON.parse(JSON.stringify(base));               // drops undefined fields
+  const plain = toJsonDataUri(meta);
+  if (utf8Bytes(plain) > META_LIMIT) {
+    throw new Error(`Too much text for the on-chain metadata limit (${utf8Bytes(plain)} / ${META_LIMIT} bytes). Shorten the description or links.`);
+  }
+  if (!bmp) return { uri: plain, meta, image: null };
+  for (const [size, q] of IMAGE_STEPS) {
+    const image = encodeImage(bmp, size, q);
+    const withImage = { ...meta, image };
+    const uri = toJsonDataUri(withImage);
+    if (utf8Bytes(uri) <= META_LIMIT) return { uri, meta: withImage, image, size };
+  }
+  return { uri: plain, meta, image: null, tooBig: true };
+}
+
+/* ───────────────────────────── views: wrap ───────────────────────────── */
+async function viewWallet(id) {
+  app.innerHTML = `
+  <div class="formcard card" style="max-width:520px">
+    <span class="chip">⇄ Utility</span>
+    <h2 style="margin-top:12px">ETH ⇄ WETH</h2>
+    <div class="muted">Ammora curves trade against WETH (<a class="mono" href="${addrUrl(WETH)}" target="_blank" rel="noopener">${short(WETH)}</a>). Buys wrap automatically — use this to wrap or unwrap manually.</div>
+    <div class="preview" id="bals"><div>ETH <b id="be">—</b></div><div>WETH <b id="bw">—</b></div></div>
+    <div class="fgrid">
+      <div class="full"><label class="l">Amount</label><input class="inp" id="wamt" inputmode="decimal" placeholder="0.01"/></div>
+      <button class="btn grad" id="wrap">Wrap ETH → WETH</button>
+      <button class="btn ghost" id="unwrap">Unwrap WETH → ETH</button>
+    </div>
+    <div class="note">Need testnet ETH? Free GIWA Sepolia ETH faucets:
+      <a href="https://faucet.giwa.io" target="_blank" rel="noopener noreferrer">GIWA Faucet</a> ·
+      <a href="https://faucet.lambda256.io/giwa-sepolia" target="_blank" rel="noopener noreferrer">Nodit</a> ·
+      <a href="https://www.alchemy.com/faucets/giwa-sepolia" target="_blank" rel="noopener noreferrer">Alchemy</a></div>
+  </div>`;
+  const load = async () => {
+    if (!W.address || id !== renderId) return;
+    const [e, w] = await Promise.all([pc.getBalance({ address: W.address }), balanceOf(WETH, W.address)]);
+    $("#be").textContent = Number(formatUnits(e, 18)).toFixed(6);
+    $("#bw").textContent = Number(formatUnits(w, 18)).toFixed(6);
+  };
+  load().catch(() => {});
+  const act = async (wrap) => {
+    try {
+      await ensureWallet();
+      const amt = parseUnits($("#wamt").value.trim() || "0", 18);
+      if (!amt) throw new Error("Enter an amount.");
+      await stepModal(wrap ? "Wrapping" : "Unwrapping", [{ label: wrap ? "Wrap ETH" : "Unwrap WETH", run: () => sendTx(
+        wrap ? { to: WETH, data: encodeFunctionData({ abi: wethAbi, functionName: "deposit" }), value: amt }
+          : { to: WETH, data: encodeFunctionData({ abi: wethAbi, functionName: "withdraw", args: [amt] }) }, wrap ? "Wrap" : "Unwrap") }]).run();
+      await load();
+    } catch (e) { toast(esc(errText(e)), "err"); }
+  };
+  $("#wrap").onclick = () => act(true);
+  $("#unwrap").onclick = () => act(false);
+}
+
+/* ───────────────────────────── views: owner setup (hidden, #/setup) ───────────────────────────── */
+// One-time owner tool: derives the Anti-sniper Config from the Standard Config (same supply, curve,
+// graduation and recipients) and only swaps in Ammora's linear fee scheduler. Not linked in the menu.
+async function viewSetup(id) {
+  const base = PRESETS[0];
+  const p = SITE.antiSniper || { cliffFeeBps: 2000, reductionBps: 100, periods: 19, periodSeconds: 15 };
+  const endBps = p.cliffFeeBps - p.reductionBps * p.periods;
+  const existing = (SITE.launchPresets || []).find((x) => x.antiSniper && x.id !== null && x.id !== undefined);
+  app.innerHTML = `<div class="formcard card" style="max-width:620px">
+    <span class="chip">⚙ Owner setup</span>
+    <h2 style="margin-top:12px">Create the Anti-sniper Config</h2>
+    <div class="muted">Copies Config #${base.id} (supply, curve, graduation, fee recipients) and replaces its flat fee with Ammora's linear fee scheduler:
+      <b>${p.cliffFeeBps / 100}%</b> at launch, −${p.reductionBps / 100}% every ${p.periodSeconds}s, ending at <b>${endBps / 100}%</b> after ${Math.round(p.periods * p.periodSeconds / 60)} min.</div>
+    ${existing ? `<div class="alert ok" style="margin-top:12px">Already configured: Anti-sniper uses Config #${existing.id}.</div>` : ""}
+    <div id="smsg"></div>
+    <button class="btn grad block" id="screate" style="margin-top:14px">${W.address ? "Create Anti-sniper Config" : "Connect owner wallet"}</button>
+    <div class="note">Only the wallet that owns Config #${base.id} should run this. Creating a Config is permissionless and costs only gas.</div></div>`;
+  $("#screate").onclick = async () => {
+    try {
+      await ensureWallet();
+      const bn = await pc.getBlockNumber();
+      const src = await A.getAmmoraV4ConfigAtBlock(pc, L.configRegistry, base.id, bn);
+      if (src.identity.owner.toLowerCase() !== W.address.toLowerCase()) throw new Error(`Connect the owner wallet of Config #${base.id} (${short(src.identity.owner)}).`);
+      const config = { ...src.config, feeSchedulerMode: 1, cliffFeeBps: p.cliffFeeBps, feeReductionFactorBps: p.reductionBps,
+        feeNumberOfPeriods: p.periods, feePeriodFrequency: p.periodSeconds, enableFirstSwapWithMinFee: false };
+      A.assertAmmoraV4Config(config, src.segments);
+      $("#screate").disabled = true;
+      let created;
+      await stepModal("Creating Anti-sniper Config", [
+        { label: "Verify Ammora V4 contracts", run: async () => verifyCore(await pc.getBlockNumber()) },
+        { label: "Register Config on-chain", run: async () => {
+          const tx = A.buildCreateAmmoraV4Config(config, src.segments, W.address);
+          const receipt = await sendTx({ to: L.configRegistry, data: tx.data }, "Create Config");
+          created = A.parseAmmoraV4ConfigCreatedReceipt(receipt, L.configRegistry);
+        } },
+      ]).run();
+      $("#smsg").innerHTML = `<div class="alert ok" style="margin-top:12px"><b>Anti-sniper Config #${created.configId} created.</b><br>
+        In <span class="mono">src/config.js</span>, set the Anti-sniper preset to <span class="mono">id: ${created.configId}n</span>, then rebuild and redeploy.</div>`;
+    } catch (e) {
+      $("#smsg").innerHTML = `<div class="alert err" style="margin-top:12px">${esc(errText(e))}</div>`;
+      const b = $("#screate"); if (b) b.disabled = false;
+    }
+  };
+}
+
+/* ───────────────────────────── router ───────────────────────────── */
+async function render() {
+  const id = ++renderId;
+  renderHeader();
+  const [route, arg] = location.hash.replace(/^#\/?/, "").split("/");
+  window.scrollTo(0, 0);
+  // Explore uses the full screen width for its token board.
+  app.classList.toggle("wide", !route || route === "explore");
+  if (route === "token" && arg) return viewToken(id, arg);
+  if (route === "create") return viewCreate(id);
+  if (route === "wallet") return viewWallet(id);
+  if (route === "swap") return viewSwap(id, arg);
+  if (route === "portfolio" || route === "earnings") return viewPortfolio(id);
+  if (route === "setup") return viewSetup(id);
+  return viewExplore(id);
+}
+window.addEventListener("hashchange", render);
+if (SITE.links?.x || SITE.links?.github) {
+  $("#footlinks").innerHTML += [SITE.links.x && ` · <a href="${esc(SITE.links.x)}" target="_blank" rel="noopener">X</a>`, SITE.links.github && ` · <a href="${esc(SITE.links.github)}" target="_blank" rel="noopener">GitHub</a>`].filter(Boolean).join("");
+}
+render();
+
+/* ───────────────────────────── ticker (under the header, on every page) ───────────────────────────── */
+// Scrolling strip of this launchpad's tokens. Hover pauses it; click opens the token.
+function renderTicker(list) {
+  const t = $("#ticker"), track = $("#ttrack");
+  if (!t || !track) return;
+  const items = list.filter((x) => isSiteConfig(x.configId) && (x.status === 1 || x.status === 2 || x.status === 3) && !isHidden(x.token, x.curve))
+    .sort((a, b) => isOfficial(b) - isOfficial(a) || (b.mcap || 0) - (a.mcap || 0)).slice(0, 24);
+  if (items.length < 3) { t.hidden = true; return; }
+  const one = items.map((x) => `<a class="titem" href="#/token/${x.curve}" title="${esc(x.name || "")}">
+      ${avatar(x, "sm")}<b>${esc(x.symbol || "?")}</b>${officialBadge(x)}
+      <span class="tcap">${mc(x.mcap, 4)}</span>
+      ${x.status === 3 ? `<span class="tchip grad">Graduated</span>` : `<span class="tchip">${pct(x.progress, 0)}%</span>`}</a>`).join("");
+  // The list is repeated twice so the loop is seamless; the speed scales with its length.
+  track.innerHTML = `<div class="tgroup">${one}</div><div class="tgroup" aria-hidden="true">${one}</div>`;
+  track.style.setProperty("--tdur", `${Math.max(30, items.length * 5)}s`);
+  t.hidden = false;
+}
+const refreshTicker = () => loadLaunches().then(renderTicker).catch(() => {});
+setTimeout(refreshTicker, 300);
+refreshEthUsd(); setInterval(refreshEthUsd, 5 * 60_000);
+setInterval(refreshTicker, 60_000);
+// Warm the browser cache for the swap module once the first page is on screen.
+setTimeout(() => (window.requestIdleCallback || ((f) => setTimeout(f, 1)))(() => loadSwapModule().catch(() => {})), 2500);
+
